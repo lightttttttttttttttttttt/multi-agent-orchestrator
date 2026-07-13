@@ -12,7 +12,8 @@ from .defaults import DEFAULT_FALLBACKS, DEFAULT_MODELS, SYSTEMS
 from .gates import require_approve, require_command_success, require_model_content
 from .locks import Budget, BudgetExceeded, FileLockManager
 from .notify import notify_failure
-from .ops import workers_for_wave
+from .ops import doctor, workers_for_wave
+from .report import export_markdown_report
 from .router import NineRouterClient, RouterError
 from .secrets import SecretScanError, require_no_secrets
 from .store import TaskStore
@@ -65,14 +66,19 @@ class Orchestrator:
         self.file_locks = FileLockManager()
         self._replan_count = 0
         self._project_for_usage: str | None = None
+        self._dead_models: set[str] = set()
 
     def _call_role(self, role: str, prompt: str, system: str, *, project_id: str | None = None):
         chain = self.fallbacks.get(role) or [self.models[role]]
         seen, models = set(), []
         for m in chain:
+            if m in self._dead_models:
+                continue
             if m not in seen:
                 seen.add(m)
                 models.append(m)
+        if not models:
+            raise RouterError(f"{role}: no live models left (blacklist={sorted(self._dead_models)})")
         errors = []
         for model in models:
             try:
@@ -88,6 +94,8 @@ class Orchestrator:
                 return result, model, errors
             except RouterError as exc:
                 errors.append(str(exc))
+                # blacklist model for rest of this orchestrator instance
+                self._dead_models.add(model)
         raise RouterError(f"{role}: all models failed: " + " | ".join(errors))
 
     def run(self, project_id: str, *, until: str | None = None) -> RunResult:
@@ -195,9 +203,13 @@ class Orchestrator:
             chain = self.fallbacks.get("implementation") or [self.models["implementation"]]
             seen, models = set(), []
             for m in chain:
+                if m in self._dead_models:
+                    continue
                 if m not in seen:
                     seen.add(m)
                     models.append(m)
+            if not models:
+                raise RouterError(f"task {task_id}: no live implement models left")
             last_errors: list[str] = []
             chosen = None
             for model in models:
@@ -233,6 +245,11 @@ class Orchestrator:
                             enforce_allowed_files(diff, allowed)
                         chosen = (model, result, diff, tag, last_errors)
                         break
+                    except RouterError as exc:
+                        last_errors.append(f"{model}/{tag}: {exc}")
+                        self._dead_models.add(model)
+                        workspace.reset_hard()
+                        break  # don't tight-retry same dead model
                     except Exception as exc:
                         last_errors.append(f"{model}/{tag}: {exc}")
                         workspace.reset_hard()
@@ -456,9 +473,16 @@ class Orchestrator:
         merge: bool = False,
         push: bool = False,
         remote: str = "origin",
+        preflight: bool = True,
     ) -> dict:
         self._project_for_usage = project_id
         try:
+            if preflight:
+                pre = doctor(probe_models=False)
+                core_fail = [c for c in pre["checks"] if c["check"] in {"9router_up", "9router_key", "git"} and not c["ok"]]
+                self.store.add_evidence(project_id, "preflight", pre)
+                if core_fail:
+                    raise RuntimeError("preflight failed: " + "; ".join(f"{c['check']}:{c['detail']}" for c in core_fail))
             while True:
                 stage = self.store.next_stage(project_id)
                 if stage is None:
@@ -486,6 +510,8 @@ class Orchestrator:
                 else {"merged": False, "reason": "merge not requested"}
             )
             project = self.store.get_project(project_id)
+            usage = self.usage.summary(project_id) if self.usage else None
+            report_path = export_markdown_report(self.store, project_id, usage)
             return {
                 "project_id": project_id,
                 "status": project["status"],
@@ -494,7 +520,9 @@ class Orchestrator:
                 "merge": merge_info,
                 "budget": self.budget.snapshot() if self.budget else None,
                 "replans": self._replan_count,
-                "usage": self.usage.summary(project_id) if self.usage else None,
+                "usage": usage,
+                "dead_models": sorted(self._dead_models),
+                "report": str(report_path),
             }
         except Exception as exc:
             note = notify_failure(f"ma ship FAILED {project_id}: {type(exc).__name__}: {exc}")

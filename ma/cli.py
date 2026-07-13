@@ -9,6 +9,7 @@ from .locks import Budget, BudgetExceeded
 from .notify import notify_failure
 from .ops import clean_project, doctor
 from .orchestrator import Orchestrator, load_9router_key
+from .report import export_markdown_report
 from .router import NineRouterClient, RouterError
 from .secrets import SecretScanError
 from .store import TaskStore
@@ -76,6 +77,9 @@ def parser() -> argparse.ArgumentParser:
     clean = sub.add_parser("clean")
     clean.add_argument("project_id")
     clean.add_argument("--delete-branches", action="store_true")
+
+    report = sub.add_parser("report")
+    report.add_argument("project_id")
     return p
 
 
@@ -126,6 +130,15 @@ def main(argv=None) -> int:
                     ensure_ascii=False,
                 )
             )
+            return 0
+        if args.command == "report":
+            ledger = UsageLedger()
+            try:
+                usage = ledger.summary(args.project_id)
+            finally:
+                ledger.close()
+            path = export_markdown_report(store, args.project_id, usage)
+            print(json.dumps({"report": str(path)}, indent=2))
             return 0
 
         budget = None

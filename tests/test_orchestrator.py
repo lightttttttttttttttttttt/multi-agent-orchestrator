@@ -313,6 +313,29 @@ class FallbackTests(unittest.TestCase):
             orch.run_stage(pid, "design")
             self.assertEqual(client.calls, ["primary", "backup"])
             self.assertEqual(store.get_artifact(pid, "design"), "OK")
+            self.assertIn("primary", orch._dead_models)
+            # second call should skip blacklisted primary
+            client.calls.clear()
+            store.record_stage = store.record_stage  # keep
+            # force next stage critique using same client fallbacks
+            orch.models["critique"] = "primary"
+            orch.fallbacks["critique"] = ["primary", "backup"]
+            orch.run_stage(pid, "critique")
+            self.assertEqual(client.calls, ["backup"])
+            store.close()
+
+    def test_export_report(self):
+        from ma.report import export_markdown_report
+
+        with tempfile.TemporaryDirectory() as d:
+            store = TaskStore(Path(d) / "state.sqlite")
+            pid = store.create_project("demo", d, "goal")
+            store.record_stage(pid, "design", "m", "p", "design artifact")
+            path = export_markdown_report(store, pid, {"total_calls": 1, "total_cost_usd": 0.01, "by_model": []}, out_dir=Path(d) / "reports")
+            self.assertTrue(path.exists())
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(pid, text)
+            self.assertIn("design artifact", text)
             store.close()
 
 
