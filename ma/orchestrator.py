@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from .approve import ApprovalError, require_human_approval
 from .defaults import DEFAULT_FALLBACKS, DEFAULT_MODELS, SYSTEMS
 from .events import CancelledError, check_cancel, clear_cancel, clear_pid, emit, write_pid
 from .gates import require_approve, require_command_success, require_model_content
@@ -452,10 +453,13 @@ class Orchestrator:
         artifact = self.store.get_artifact(project_id, "audit")
         return require_approve(artifact)
 
-    def merge(self, project_id: str, *, push: bool = False, remote: str = "origin") -> dict:
+    def merge(self, project_id: str, *, push: bool = False, remote: str = "origin", require_approval: bool = False) -> dict:
         project = self.store.get_project(project_id)
         audit = self.store.get_artifact(project_id, "audit")
         require_approve(audit)
+        if require_approval or push:
+            # push always requires explicit human approval gate when enabled by caller
+            require_human_approval(project_id)
         integration = Workspace(project["repo"], project_id, task_id="integration")
         if integration.path.exists():
             result = integration.merge_into_repo(f"ma: {project_id} approved")
@@ -480,6 +484,7 @@ class Orchestrator:
         push: bool = False,
         remote: str = "origin",
         preflight: bool = True,
+        require_approval: bool = False,
     ) -> dict:
         self._project_for_usage = project_id
         clear_cancel(project_id)
@@ -521,7 +526,7 @@ class Orchestrator:
                     continue
                 break
             merge_info = (
-                self.merge(project_id, push=push, remote=remote)
+                self.merge(project_id, push=push, remote=remote, require_approval=require_approval or push)
                 if merge
                 else {"merged": False, "reason": "merge not requested"}
             )

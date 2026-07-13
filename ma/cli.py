@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import time
 import traceback
 from pathlib import Path
 
+from .approve import ApprovalError, grant_approval, revoke_approval
 from .events import CancelledError, request_cancel, tail_events
 from .gates import GateError
 from .locks import Budget, BudgetExceeded
@@ -57,6 +59,7 @@ def parser() -> argparse.ArgumentParser:
     merge.add_argument("project_id")
     merge.add_argument("--push", action="store_true")
     merge.add_argument("--remote", default="origin")
+    merge.add_argument("--require-approval", action="store_true")
 
     ship = sub.add_parser("ship")
     ship.add_argument("repo")
@@ -71,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
     ship.add_argument("--max-tokens", type=int, default=None)
     ship.add_argument("--max-replans", type=int, default=1)
     ship.add_argument("--workers", type=int, default=0)
+    ship.add_argument("--require-approval", action="store_true", help="require ma approve before merge/push")
 
     usage = sub.add_parser("usage")
     usage.add_argument("project_id", nargs="?")
@@ -93,12 +97,18 @@ def parser() -> argparse.ArgumentParser:
 
     cancel = sub.add_parser("cancel")
     cancel.add_argument("project_id")
-    cancel.add_argument("--soft", action="store_true", help="marker only, do not kill process")
+    cancel.add_argument("--soft", action="store_true")
+
+    approve = sub.add_parser("approve")
+    approve.add_argument("project_id")
+    approve.add_argument("--note", default="approved")
+    approve.add_argument("--revoke", action="store_true")
 
     enqueue = sub.add_parser("enqueue")
     enqueue.add_argument("repo")
     enqueue.add_argument("goal")
     enqueue.add_argument("--verify", default=None)
+    enqueue.add_argument("--token", default=None)
 
     qlist = sub.add_parser("queue")
     qlist.add_argument("--limit", type=int, default=20)
@@ -107,10 +117,15 @@ def parser() -> argparse.ArgumentParser:
     qget.add_argument("job_id")
 
     worker = sub.add_parser("worker")
-    worker.add_argument("--id", default=None, help="worker id")
+    worker.add_argument("--id", default=None)
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--poll", type=float, default=2.0)
+    worker.add_argument("--token", default=None)
     return p
+
+
+def _token(args_token: str | None) -> str | None:
+    return args_token or os.environ.get("MA_QUEUE_TOKEN")
 
 
 def main(argv=None) -> int:
@@ -158,10 +173,18 @@ def main(argv=None) -> int:
         if args.command == "cancel":
             print(json.dumps(request_cancel(args.project_id, hard=not args.soft), indent=2))
             return 0
+        if args.command == "approve":
+            if args.revoke:
+                revoke_approval(args.project_id)
+                print(json.dumps({"revoked": args.project_id}))
+            else:
+                path = grant_approval(args.project_id, args.note)
+                print(json.dumps({"approved": args.project_id, "path": str(path)}))
+            return 0
         if args.command == "enqueue":
             q = JobQueue()
             try:
-                job_id = q.enqueue(repo=str(Path(args.repo).resolve()), goal=args.goal, verify_command=args.verify)
+                job_id = q.enqueue(repo=str(Path(args.repo).resolve()), goal=args.goal, verify_command=args.verify, token=_token(args.token))
                 print(json.dumps({"job_id": job_id}, indent=2))
             finally:
                 q.close()
@@ -182,10 +205,11 @@ def main(argv=None) -> int:
             return 0
         if args.command == "worker":
             worker_id = args.id or f"{socket.gethostname()}-{int(time.time())}"
+            token = _token(args.token)
             q = JobQueue()
             try:
                 while True:
-                    job = q.claim(worker_id)
+                    job = q.claim(worker_id, token=token)
                     if not job:
                         if args.once:
                             print(json.dumps({"worker": worker_id, "claimed": None}))
@@ -198,10 +222,10 @@ def main(argv=None) -> int:
                         orch = Orchestrator(store, client, max_workers=0)
                         pid = store.create_project(f"job-{job['id']}", job["repo"], job["goal"])
                         result = orch.ship(pid, verify_command=job.get("verify_command"), merge=False)
-                        q.complete(job["id"], result)
+                        q.complete(job["id"], result, token=token)
                         print(json.dumps({"worker": worker_id, "job": job["id"], "status": "DONE"}, flush=True))
                     except Exception as exc:
-                        q.fail(job["id"], f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1000:]}")
+                        q.fail(job["id"], f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1000:]}", token=token)
                         print(json.dumps({"worker": worker_id, "job": job["id"], "status": "FAILED", "error": str(exc)}, flush=True))
                     if args.once:
                         return 0
@@ -232,17 +256,24 @@ def main(argv=None) -> int:
             print(orchestrator.audit(args.project_id))
             return 0
         if args.command == "merge":
-            print(json.dumps(orchestrator.merge(args.project_id, push=args.push, remote=args.remote), indent=2, ensure_ascii=False))
+            print(json.dumps(orchestrator.merge(args.project_id, push=args.push, remote=args.remote, require_approval=args.require_approval or args.push), indent=2, ensure_ascii=False))
             return 0
         if args.command == "ship":
             repo = str(Path(args.repo).resolve())
             if not Path(repo).is_dir():
                 raise SystemExit(f"repo does not exist: {repo}")
             pid = args.project_id or store.create_project(args.name, repo, args.goal)
-            result = orchestrator.ship(pid, verify_command=args.verify, merge=args.merge or args.push, push=args.push, remote=args.remote)
+            result = orchestrator.ship(
+                pid,
+                verify_command=args.verify,
+                merge=args.merge or args.push,
+                push=args.push,
+                remote=args.remote,
+                require_approval=args.require_approval or args.push,
+            )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
-    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError, CancelledError, QueueError) as exc:
+    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError, CancelledError, QueueError, ApprovalError) as exc:
         note = notify_failure(f"ma {args.command} FAILED: {type(exc).__name__}: {exc}")
         print(f"MODEL FAILURE: {exc}")
         print(json.dumps({"notify": note}, ensure_ascii=False))

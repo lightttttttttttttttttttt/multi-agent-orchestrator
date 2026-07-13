@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -9,6 +10,27 @@ from pathlib import Path
 
 class QueueError(RuntimeError):
     pass
+
+
+def queue_token() -> str | None:
+    # Shared secret for multi-worker claim/enqueue. Optional for local single-user.
+    return os.environ.get("MA_QUEUE_TOKEN") or _token_file()
+
+
+def _token_file() -> str | None:
+    p = Path.home() / ".ma" / "queue.token"
+    if p.exists():
+        val = p.read_text(encoding="utf-8").strip()
+        return val or None
+    return None
+
+
+def require_queue_token(provided: str | None):
+    expected = queue_token()
+    if not expected:
+        return  # open local mode
+    if not provided or provided != expected:
+        raise QueueError("invalid or missing queue token (set MA_QUEUE_TOKEN or ~/.ma/queue.token)")
 
 
 class JobQueue:
@@ -41,7 +63,8 @@ class JobQueue:
     def close(self):
         self.db.close()
 
-    def enqueue(self, *, repo: str, goal: str, verify_command: str | None = None) -> str:
+    def enqueue(self, *, repo: str, goal: str, verify_command: str | None = None, token: str | None = None) -> str:
+        require_queue_token(token)
         job_id = uuid.uuid4().hex[:12]
         now = int(time.time())
         self.db.execute(
@@ -51,7 +74,8 @@ class JobQueue:
         self.db.commit()
         return job_id
 
-    def claim(self, worker_id: str) -> dict | None:
+    def claim(self, worker_id: str, token: str | None = None) -> dict | None:
+        require_queue_token(token)
         self.db.execute("BEGIN IMMEDIATE")
         row = self.db.execute(
             "SELECT * FROM jobs WHERE status='QUEUED' ORDER BY created_at LIMIT 1"
@@ -67,14 +91,16 @@ class JobQueue:
         self.db.commit()
         return dict(self.db.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone())
 
-    def complete(self, job_id: str, result: dict):
+    def complete(self, job_id: str, result: dict, token: str | None = None):
+        require_queue_token(token)
         self.db.execute(
             "UPDATE jobs SET status=?, result=?, updated_at=? WHERE id=?",
             ("DONE", json.dumps(result), int(time.time()), job_id),
         )
         self.db.commit()
 
-    def fail(self, job_id: str, error: str):
+    def fail(self, job_id: str, error: str, token: str | None = None):
+        require_queue_token(token)
         self.db.execute(
             "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
             ("FAILED", error, int(time.time()), job_id),

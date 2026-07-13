@@ -403,6 +403,60 @@ class QueueTests(unittest.TestCase):
             self.assertIsNone(q.claim("worker-2"))
             q.close()
 
+    def test_queue_token_required_when_configured(self):
+        from ma import queue as qmod
+
+        with tempfile.TemporaryDirectory() as d:
+            token_file = Path(d) / "queue.token"
+            token_file.write_text("secret-token", encoding="utf-8")
+            old_home = Path.home
+            # patch token file lookup via env
+            import os
+            old = os.environ.get("MA_QUEUE_TOKEN")
+            os.environ["MA_QUEUE_TOKEN"] = "secret-token"
+            try:
+                with self.assertRaises(qmod.QueueError):
+                    qmod.require_queue_token(None)
+                with self.assertRaises(qmod.QueueError):
+                    qmod.require_queue_token("wrong")
+                qmod.require_queue_token("secret-token")
+            finally:
+                if old is None:
+                    os.environ.pop("MA_QUEUE_TOKEN", None)
+                else:
+                    os.environ["MA_QUEUE_TOKEN"] = old
+
+
+class ApprovalTests(unittest.TestCase):
+    def test_human_approval_gate(self):
+        from ma import approve
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            old = approve.approval_path
+            approve.approval_path = lambda project_id, base_dir=base: old(project_id, base_dir)  # type: ignore
+            old_root = approve._root
+            approve._root = lambda base_dir=base: old_root(base_dir)  # type: ignore
+            try:
+                with self.assertRaises(approve.ApprovalError):
+                    approve.require_human_approval("p1")
+                approve.grant_approval("p1", "ok")
+                approve.require_human_approval("p1")
+                approve.revoke_approval("p1")
+                with self.assertRaises(approve.ApprovalError):
+                    approve.require_human_approval("p1")
+            finally:
+                approve.approval_path = old  # type: ignore
+                approve._root = old_root  # type: ignore
+
+
+class UsageTokenTests(unittest.TestCase):
+    def test_extract_provider_usage_preferred(self):
+        from ma.usage import extract_usage_tokens
+
+        p, c, src = extract_usage_tokens({"usage": {"prompt_tokens": 11, "completion_tokens": 7}}, "x" * 100, "y" * 100)
+        self.assertEqual((p, c, src), (11, 7, "provider.usage"))
+
 
 class GateTests(unittest.TestCase):
     def test_model_content_gate_rejects_whitespace(self):
