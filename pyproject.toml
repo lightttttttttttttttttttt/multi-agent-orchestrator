@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quang-multi-agent"
+version = "0.1.0"
+description = "Durable multi-model orchestrator over a local 9Router gateway"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ma = "ma.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ma*"]
