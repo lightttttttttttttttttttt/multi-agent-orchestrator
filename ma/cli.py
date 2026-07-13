@@ -4,29 +4,55 @@ import argparse
 import json
 from pathlib import Path
 
+from .gates import GateError
+from .notify import notify_failure
 from .orchestrator import Orchestrator, load_9router_key
 from .router import NineRouterClient, RouterError
 from .store import TaskStore
+from .tasks import TaskSpecError
+from .workspace import WorkspaceError
 
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ma", description="Durable multi-model orchestrator over 9Router")
     p.add_argument("--db", default=str(Path.home() / ".ma" / "state.sqlite"))
     sub = p.add_subparsers(dest="command", required=True)
+
     init = sub.add_parser("init")
     init.add_argument("repo")
     init.add_argument("goal")
     init.add_argument("--name", default="project")
+
     run = sub.add_parser("run")
     run.add_argument("project_id")
     run.add_argument("--until", choices=["design", "critique", "judgment", "audit", "report"])
+
     status = sub.add_parser("status")
     status.add_argument("project_id", nargs="?")
+
     show = sub.add_parser("show")
     show.add_argument("project_id")
+
     verify = sub.add_parser("verify")
     verify.add_argument("project_id")
     verify.add_argument("command_line")
+
+    implement = sub.add_parser("implement")
+    implement.add_argument("project_id")
+
+    audit = sub.add_parser("audit")
+    audit.add_argument("project_id")
+
+    merge = sub.add_parser("merge")
+    merge.add_argument("project_id")
+
+    ship = sub.add_parser("ship")
+    ship.add_argument("repo")
+    ship.add_argument("goal")
+    ship.add_argument("--name", default="ship")
+    ship.add_argument("--verify", default=None, help="test command; defaults to task DAG verify or unittest")
+    ship.add_argument("--merge", action="store_true", help="merge worktree into repo only after APPROVE")
+    ship.add_argument("--project-id", default=None, help="resume existing project id")
     return p
 
 
@@ -46,10 +72,22 @@ def main(argv=None) -> int:
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
         if args.command == "show":
-            print(json.dumps({"project": store.get_project(args.project_id), "stages": store.list_stages(args.project_id)}, indent=2, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {
+                        "project": store.get_project(args.project_id),
+                        "stages": store.list_stages(args.project_id),
+                        "tasks": store.list_tasks(args.project_id),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
+
         client = NineRouterClient("http://127.0.0.1:20128", load_9router_key(), timeout=15, attempts=3)
         orchestrator = Orchestrator(store, client)
+
         if args.command == "run":
             result = orchestrator.run(args.project_id, until=args.until)
             print(json.dumps(result.__dict__, indent=2))
@@ -57,8 +95,27 @@ def main(argv=None) -> int:
         if args.command == "verify":
             print(json.dumps(orchestrator.verify(args.project_id, args.command_line), indent=2, ensure_ascii=False))
             return 0
-    except RouterError as exc:
+        if args.command == "implement":
+            print(json.dumps(orchestrator.implement(args.project_id), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "audit":
+            print(orchestrator.audit(args.project_id))
+            return 0
+        if args.command == "merge":
+            print(json.dumps(orchestrator.merge(args.project_id), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "ship":
+            repo = str(Path(args.repo).resolve())
+            if not Path(repo).is_dir():
+                raise SystemExit(f"repo does not exist: {repo}")
+            pid = args.project_id or store.create_project(args.name, repo, args.goal)
+            result = orchestrator.ship(pid, verify_command=args.verify, merge=args.merge)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+    except (RouterError, GateError, WorkspaceError, TaskSpecError) as exc:
+        note = notify_failure(f"ma {args.command} FAILED: {type(exc).__name__}: {exc}")
         print(f"MODEL FAILURE: {exc}")
+        print(json.dumps({"notify": note}, ensure_ascii=False))
         return 2
     finally:
         store.close()
