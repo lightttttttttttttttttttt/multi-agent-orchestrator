@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .events import CancelledError, request_cancel, tail_events
 from .gates import GateError
 from .locks import Budget, BudgetExceeded
 from .notify import notify_failure
@@ -80,6 +81,14 @@ def parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report")
     report.add_argument("project_id")
+
+    watch = sub.add_parser("watch")
+    watch.add_argument("project_id")
+    watch.add_argument("--follow", action="store_true")
+    watch.add_argument("--idle", type=float, default=30.0, help="follow idle timeout seconds")
+
+    cancel = sub.add_parser("cancel")
+    cancel.add_argument("project_id")
     return p
 
 
@@ -139,6 +148,14 @@ def main(argv=None) -> int:
                 ledger.close()
             path = export_markdown_report(store, args.project_id, usage)
             print(json.dumps({"report": str(path)}, indent=2))
+            return 0
+        if args.command == "watch":
+            for ev in tail_events(args.project_id, follow=args.follow, max_idle=args.idle):
+                print(json.dumps(ev, ensure_ascii=False), flush=True)
+            return 0
+        if args.command == "cancel":
+            path = request_cancel(args.project_id)
+            print(json.dumps({"cancel": str(path), "project_id": args.project_id}, indent=2))
             return 0
 
         budget = None
@@ -201,7 +218,7 @@ def main(argv=None) -> int:
             )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
-    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError) as exc:
+    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError, CancelledError) as exc:
         note = notify_failure(f"ma {args.command} FAILED: {type(exc).__name__}: {exc}")
         print(f"MODEL FAILURE: {exc}")
         print(json.dumps({"notify": note}, ensure_ascii=False))

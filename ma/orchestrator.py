@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .defaults import DEFAULT_FALLBACKS, DEFAULT_MODELS, SYSTEMS
+from .events import CancelledError, check_cancel, clear_cancel, emit
 from .gates import require_approve, require_command_success, require_model_content
 from .locks import Budget, BudgetExceeded, FileLockManager
 from .notify import notify_failure
@@ -109,6 +110,8 @@ class Orchestrator:
         return RunResult(project_id, project["status"], self.store.next_stage(project_id))
 
     def run_stage(self, project_id: str, stage: str):
+        check_cancel(project_id)
+        emit(project_id, "stage_start", stage=stage)
         project = self.store.get_project(project_id)
         context = self._context(project_id, stage)
         prompt = f"PROJECT GOAL:\n{project['goal']}\n\nREPOSITORY:\n{project['repo']}\n\nCONTEXT:\n{context}"
@@ -126,6 +129,7 @@ class Orchestrator:
                 "fallback_errors": fallback_errors,
             },
         )
+        emit(project_id, "stage_done", stage=stage, model=model, chars=len(artifact))
         if stage == "judgment":
             try:
                 tasks = parse_task_dag(artifact)
@@ -144,8 +148,10 @@ class Orchestrator:
                     ],
                 )
                 self.store.add_evidence(project_id, "task_dag", {"count": len(tasks), "ids": [t.id for t in tasks]})
+                emit(project_id, "task_dag", count=len(tasks), ids=[t.id for t in tasks])
             except Exception as exc:
                 self.store.add_evidence(project_id, "task_dag_parse_error", {"error": str(exc)})
+                emit(project_id, "task_dag_parse_error", error=str(exc))
 
     def verify(self, project_id: str, command: str):
         project = self.store.get_project(project_id)
@@ -476,14 +482,19 @@ class Orchestrator:
         preflight: bool = True,
     ) -> dict:
         self._project_for_usage = project_id
+        clear_cancel(project_id)
+        emit(project_id, "ship_start", merge=merge, push=push)
         try:
             if preflight:
+                check_cancel(project_id)
                 pre = doctor(probe_models=False)
                 core_fail = [c for c in pre["checks"] if c["check"] in {"9router_up", "9router_key", "git"} and not c["ok"]]
                 self.store.add_evidence(project_id, "preflight", pre)
+                emit(project_id, "preflight", ok=not core_fail)
                 if core_fail:
                     raise RuntimeError("preflight failed: " + "; ".join(f"{c['check']}:{c['detail']}" for c in core_fail))
             while True:
+                check_cancel(project_id)
                 stage = self.store.next_stage(project_id)
                 if stage is None:
                     break
@@ -491,14 +502,18 @@ class Orchestrator:
                     self.run_stage(project_id, stage)
                     continue
                 if stage == "implementation":
+                    emit(project_id, "implement_start")
                     self.implement(project_id)
+                    emit(project_id, "implement_done")
                     continue
                 if stage == "verification":
                     cmd = verify_command
                     if not cmd:
                         tasks = self.store.list_tasks(project_id)
                         cmd = tasks[0]["verify_command"] if tasks else "python -m unittest discover -s . -v"
+                    emit(project_id, "verify_start", command=cmd)
                     self.verify(project_id, cmd)
+                    emit(project_id, "verify_done", command=cmd)
                     continue
                 if stage == "audit":
                     self.audit(project_id)
@@ -512,7 +527,7 @@ class Orchestrator:
             project = self.store.get_project(project_id)
             usage = self.usage.summary(project_id) if self.usage else None
             report_path = export_markdown_report(self.store, project_id, usage)
-            return {
+            result = {
                 "project_id": project_id,
                 "status": project["status"],
                 "next_stage": self.store.next_stage(project_id),
@@ -524,7 +539,14 @@ class Orchestrator:
                 "dead_models": sorted(self._dead_models),
                 "report": str(report_path),
             }
+            emit(project_id, "ship_done", status=project["status"], report=str(report_path))
+            clear_cancel(project_id)
+            return result
+        except CancelledError:
+            self.store.add_evidence(project_id, "cancelled", {"project_id": project_id})
+            raise
         except Exception as exc:
+            emit(project_id, "ship_failed", error=str(exc))
             note = notify_failure(f"ma ship FAILED {project_id}: {type(exc).__name__}: {exc}")
             self.store.add_evidence(project_id, "failure", {"error": str(exc), "notify": note})
             raise

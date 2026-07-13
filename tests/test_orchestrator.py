@@ -339,6 +339,37 @@ class FallbackTests(unittest.TestCase):
             store.close()
 
 
+class EventsTests(unittest.TestCase):
+    def test_emit_and_cancel(self):
+        from ma import events
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            # monkeypatch event base via explicit path helpers
+            pid = "projtest"
+            # temporarily point helpers by writing using custom base wrappers
+            p = events.events_path(pid, base)
+            events.emit.__defaults__  # keep linter quiet
+            # write via patched functions
+            old_events = events.events_path
+            old_cancel = events.cancel_path
+            events.events_path = lambda project_id, base_dir=base: old_events(project_id, base_dir)  # type: ignore
+            events.cancel_path = lambda project_id, base_dir=base: old_cancel(project_id, base_dir)  # type: ignore
+            try:
+                events.clear_cancel(pid)
+                events.emit(pid, "ship_start")
+                events.request_cancel(pid)
+                with self.assertRaises(events.CancelledError):
+                    events.check_cancel(pid)
+                items = list(events.tail_events(pid, follow=False))
+                names = [i["event"] for i in items]
+                self.assertIn("ship_start", names)
+                self.assertIn("cancel_requested", names)
+            finally:
+                events.events_path = old_events  # type: ignore
+                events.cancel_path = old_cancel  # type: ignore
+
+
 class GateTests(unittest.TestCase):
     def test_model_content_gate_rejects_whitespace(self):
         with self.assertRaises(GateError):
