@@ -1,17 +1,23 @@
 # Quang Multi-Agent Orchestrator
 
-Durable local controller over 9Router: multi-model roles, SQLite state, per-task git worktrees, DAG waves, file locks, parallel workers, machine verification, Sol audit, optional merge, Telegram fail notify.
+Durable local multi-model software factory over 9Router.
 
-## Model policy
+## Features
 
-| Role | Primary | Fallback |
-|---|---|---|
-| Design / Judgment / Audit | `Ntt_Codex10tr/gpt-5.6-sol` | `nttcodex/gpt-5.6-sol` |
-| Critique | `nttcodex/grok-4.5-high` | Sol |
-| Implementation | `nttcodex/deepseek-v4-pro` | `nttcodex/glm-5.2` |
-| Report | Gemini Flash | Gemini 2.5 → Sol |
-
-Timeout **15s × 3** per model, then next fallback. Empty HTTP 200 = fail.
+- Role routing: Sol / Grok / DeepSeek / Gemini + fallbacks
+- 15s × 3 timeout brake, then next model
+- SQLite durable project/task state
+- Task DAG with `allowed_files` + dependencies
+- Per-task git worktrees/branches
+- DAG waves + **cross-process file locks** (`~/.ma/file_locks.sqlite`)
+- Parallel independent tasks (`--workers`)
+- Integration worktree for final verify/audit/merge
+- Machine verification gate
+- Sol `APPROVE` audit gate
+- Mid-ship **replan** on task failure (`--max-replans`)
+- **Budget caps**: `--max-calls`, `--max-tokens`
+- Optional merge + optional remote push
+- Telegram failure notify
 
 ## Install
 
@@ -20,32 +26,32 @@ cd C:/Users/OS/multi-agent-orchestrator
 python -m pip install -e .
 ```
 
-## One command
+## Use
 
 ```bash
-ma ship C:/path/to/repo "Implement feature X" --verify "python -m unittest -v"
-ma ship ... --merge              # merge after Sol APPROVE
-ma ship ... --project-id ABC     # resume
+# one command
+ma ship C:/repo "goal" --verify "pytest -q"
+
+# with budgets + parallel workers
+ma ship C:/repo "goal" --verify "pytest -q" --workers 2 --max-calls 40 --max-tokens 200000 --max-replans 1
+
+# merge after APPROVE
+ma ship C:/repo "goal" --verify "pytest -q" --merge
+
+# merge + push
+ma ship C:/repo "goal" --verify "pytest -q" --push --remote origin
+
+# resume
+ma ship C:/repo "goal" --project-id ABC --verify "pytest -q"
 ```
 
-## Manual gates
+Manual:
 
 ```bash
-ma init / ma run / ma implement / ma verify / ma audit / ma merge / ma show
+ma init / ma run / ma implement / ma verify / ma audit / ma merge [--push] / ma show
 ```
 
-## Pipeline
-
-1. design → Sol  
-2. critique → Grok  
-3. judgment → Sol + task DAG JSON  
-4. implementation → **per-task worktrees**, DAG waves, file locks, parallel independent tasks  
-5. verification → machine tests on integration worktree  
-6. audit → Sol must start with `APPROVE`  
-7. report  
-8. merge (optional, no remote push)
-
-### Task DAG JSON (from judgment)
+## Task DAG (judgment output)
 
 ```json
 [{
@@ -57,18 +63,15 @@ ma init / ma run / ma implement / ma verify / ma audit / ma merge / ma show
 }]
 ```
 
-- Tasks with no deps and no shared `allowed_files` run in the **same wave in parallel** (default `max_workers=2`).
-- Overlapping files are serialized.
-- Each task gets `ma/<project>/<task>` worktree + branch.
-- Integration worktree merges task branches for final verify/audit/merge.
+Independent non-overlapping tasks run in parallel. Failures can replan once (default).
 
-## Failure notify
+## Safety
 
-Telegram via Hermes env. Exit code `2` on failure.
-
-## State
-
-`C:/Users/OS/.ma/state.sqlite`
+- No push unless `--push`
+- No merge unless `--merge`/`--push` and Sol returns APPROVE
+- Empty model content fails
+- Patch outside `allowed_files` fails
+- Budget exceeded exits 2 + Telegram notify
 
 ## Tests
 
@@ -78,6 +81,4 @@ python -m unittest discover -s tests -v
 
 ## Boundary
 
-Has: routing, fallback, DAG, file lock, parallel waves, per-task worktrees, verify, audit, optional merge, Telegram.
-
-Not yet: remote push, multi-project global file lock across processes, dynamic replan mid-ship, budget/token caps.
+Still not: multi-machine orchestration, automatic secret scanning beyond allowed_files, dynamic worker pool autoscaling, cost accounting against real provider invoices.

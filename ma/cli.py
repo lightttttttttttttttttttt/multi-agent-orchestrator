@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .gates import GateError
+from .locks import Budget, BudgetExceeded
 from .notify import notify_failure
 from .orchestrator import Orchestrator, load_9router_key
 from .router import NineRouterClient, RouterError
@@ -45,14 +46,22 @@ def parser() -> argparse.ArgumentParser:
 
     merge = sub.add_parser("merge")
     merge.add_argument("project_id")
+    merge.add_argument("--push", action="store_true")
+    merge.add_argument("--remote", default="origin")
 
     ship = sub.add_parser("ship")
     ship.add_argument("repo")
     ship.add_argument("goal")
     ship.add_argument("--name", default="ship")
-    ship.add_argument("--verify", default=None, help="test command; defaults to task DAG verify or unittest")
-    ship.add_argument("--merge", action="store_true", help="merge worktree into repo only after APPROVE")
-    ship.add_argument("--project-id", default=None, help="resume existing project id")
+    ship.add_argument("--verify", default=None)
+    ship.add_argument("--merge", action="store_true")
+    ship.add_argument("--push", action="store_true", help="push after merge (implies --merge)")
+    ship.add_argument("--remote", default="origin")
+    ship.add_argument("--project-id", default=None)
+    ship.add_argument("--max-calls", type=int, default=None, help="budget: max model calls")
+    ship.add_argument("--max-tokens", type=int, default=None, help="budget: rough max tokens (chars/4)")
+    ship.add_argument("--max-replans", type=int, default=1)
+    ship.add_argument("--workers", type=int, default=2)
     return p
 
 
@@ -85,8 +94,28 @@ def main(argv=None) -> int:
             )
             return 0
 
-        client = NineRouterClient("http://127.0.0.1:20128", load_9router_key(), timeout=15, attempts=3)
-        orchestrator = Orchestrator(store, client)
+        budget = None
+        max_replans = 1
+        workers = 2
+        if args.command == "ship":
+            budget = Budget(max_calls=args.max_calls, max_tokens=args.max_tokens)
+            max_replans = args.max_replans
+            workers = args.workers
+
+        client = NineRouterClient(
+            "http://127.0.0.1:20128",
+            load_9router_key(),
+            timeout=15,
+            attempts=3,
+            budget=budget,
+        )
+        orchestrator = Orchestrator(
+            store,
+            client,
+            max_workers=workers,
+            budget=budget,
+            max_replans=max_replans,
+        )
 
         if args.command == "run":
             result = orchestrator.run(args.project_id, until=args.until)
@@ -102,17 +131,30 @@ def main(argv=None) -> int:
             print(orchestrator.audit(args.project_id))
             return 0
         if args.command == "merge":
-            print(json.dumps(orchestrator.merge(args.project_id), indent=2, ensure_ascii=False))
+            print(
+                json.dumps(
+                    orchestrator.merge(args.project_id, push=args.push, remote=args.remote),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
         if args.command == "ship":
             repo = str(Path(args.repo).resolve())
             if not Path(repo).is_dir():
                 raise SystemExit(f"repo does not exist: {repo}")
             pid = args.project_id or store.create_project(args.name, repo, args.goal)
-            result = orchestrator.ship(pid, verify_command=args.verify, merge=args.merge)
+            do_merge = args.merge or args.push
+            result = orchestrator.ship(
+                pid,
+                verify_command=args.verify,
+                merge=do_merge,
+                push=args.push,
+                remote=args.remote,
+            )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
-    except (RouterError, GateError, WorkspaceError, TaskSpecError) as exc:
+    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded) as exc:
         note = notify_failure(f"ma {args.command} FAILED: {type(exc).__name__}: {exc}")
         print(f"MODEL FAILURE: {exc}")
         print(json.dumps({"notify": note}, ensure_ascii=False))

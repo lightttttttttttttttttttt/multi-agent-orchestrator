@@ -21,14 +21,16 @@ class ModelResult:
     content: str
     latency_ms: int
     raw: dict
+    prompt_chars: int = 0
 
 
 class NineRouterClient:
-    def __init__(self, base_url: str, api_key: str, timeout: int = 15, attempts: int = 3):
+    def __init__(self, base_url: str, api_key: str, timeout: int = 15, attempts: int = 3, budget=None):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.attempts = attempts
+        self.budget = budget
 
     def call(self, model: str, prompt: str, *, system: str = "", api: str = "chat") -> ModelResult:
         if api == "responses":
@@ -74,7 +76,15 @@ class NineRouterClient:
         content = self._extract(raw, api)
         if not content.strip():
             raise EmptyResponseError(f"{model}: HTTP success but empty model output")
-        return ModelResult(model, content.strip(), int((time.monotonic() - started) * 1000), raw)
+        if self.budget is not None:
+            self.budget.charge(prompt=system + "\n" + prompt, content=content, model=model)
+        return ModelResult(
+            model,
+            content.strip(),
+            int((time.monotonic() - started) * 1000),
+            raw,
+            prompt_chars=len(system) + len(prompt),
+        )
 
     @staticmethod
     def _extract(raw: dict, api: str) -> str:

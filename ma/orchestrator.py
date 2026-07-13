@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .gates import require_approve, require_command_success, require_model_content
-from .locks import FileLockManager
+from .locks import Budget, BudgetExceeded, FileLockManager
 from .notify import notify_failure
 from .router import NineRouterClient, RouterError
 from .store import TaskStore
@@ -75,13 +75,20 @@ class Orchestrator:
         models: dict | None = None,
         fallbacks: dict | None = None,
         max_workers: int = 2,
+        budget: Budget | None = None,
+        max_replans: int = 1,
     ):
         self.store = store
         self.client = client
         self.models = DEFAULT_MODELS | (models or {})
         self.fallbacks = DEFAULT_FALLBACKS | (fallbacks or {})
         self.max_workers = max_workers
+        self.budget = budget
+        if budget is not None and getattr(client, "budget", None) is None:
+            client.budget = budget
+        self.max_replans = max_replans
         self.file_locks = FileLockManager()
+        self._replan_count = 0
 
     def _call_role(self, role: str, prompt: str, system: str):
         chain = self.fallbacks.get(role) or [self.models[role]]
@@ -188,7 +195,7 @@ class Orchestrator:
     def _implement_one_task(self, project: dict, project_id: str, task: dict, base: str = "HEAD") -> dict:
         task_id = task["id"]
         allowed = task["allowed_files"]
-        self.file_locks.acquire(task_id, allowed)
+        self.file_locks.acquire(task_id, allowed, project_id=project_id)
         try:
             self.store.set_task_status(task_id, "IMPLEMENTING")
             workspace = Workspace(project["repo"], project_id, task_id=task_id)
@@ -299,38 +306,104 @@ class Orchestrator:
 
         waves = ready_waves(tasks)
         all_results: list[dict] = []
-        for wave_idx, wave in enumerate(waves):
+        pending = list(tasks)
+        wave_idx = 0
+        while pending:
+            waves = ready_waves(pending)
+            wave = waves[0]
             self.store.add_evidence(project_id, "wave_start", {"wave": wave_idx, "tasks": [t["id"] for t in wave]})
+            wave_results = []
+            failures = []
             if len(wave) == 1 or self.max_workers <= 1:
                 for t in wave:
-                    all_results.append(self._implement_one_task(project, project_id, t))
+                    try:
+                        wave_results.append(self._implement_one_task(project, project_id, t))
+                    except Exception as exc:
+                        failures.append((t, exc))
             else:
                 with ThreadPoolExecutor(max_workers=min(self.max_workers, len(wave))) as pool:
-                    futures = {pool.submit(self._implement_one_task, project, project_id, t): t["id"] for t in wave}
+                    futures = {pool.submit(self._implement_one_task, project, project_id, t): t for t in wave}
                     for fut in as_completed(futures):
-                        tid = futures[fut]
+                        t = futures[fut]
                         try:
-                            all_results.append(fut.result())
+                            wave_results.append(fut.result())
                         except Exception as exc:
-                            raise RuntimeError(f"parallel task {tid} failed: {exc}") from exc
-            self.store.add_evidence(project_id, "wave_done", {"wave": wave_idx, "results": [r["task_id"] for r in all_results if r.get("task_id") in {t['id'] for t in wave}]})
+                            failures.append((t, exc))
+            all_results.extend(wave_results)
+            self.store.add_evidence(
+                project_id,
+                "wave_done",
+                {"wave": wave_idx, "ok": [r["task_id"] for r in wave_results], "failed": [t["id"] for t, _ in failures]},
+            )
+            if failures:
+                if self._replan_count >= self.max_replans:
+                    raise RuntimeError(
+                        f"task failures and replan budget exhausted: "
+                        + "; ".join(f"{t['id']}: {e}" for t, e in failures)
+                    )
+                self._replan_count += 1
+                fail_report = "\n".join(f"- {t['id']}: {e}" for t, e in failures)
+                self.store.add_evidence(project_id, "replan_start", {"wave": wave_idx, "failures": fail_report})
+                replan_prompt = (
+                    f"PROJECT GOAL:\n{project['goal']}\n\n"
+                    f"CURRENT PLAN:\n{self.store.get_artifact(project_id, 'judgment')}\n\n"
+                    f"FAILED TASKS:\n{fail_report}\n\n"
+                    "Replan ONLY the failed work as a JSON task array with id/goal/allowed_files/verify_command/depends_on. "
+                    "Do not redo successful tasks. Keep allowed_files minimal."
+                )
+                result, model, errors = self._call_role("judgment", replan_prompt, SYSTEMS["judgment"])
+                new_tasks = parse_task_dag(require_model_content(result.content))
+                # keep successful tasks; replace remaining with replan + not-yet-run
+                done_ids = {r["task_id"] for r in all_results}
+                failed_ids = {t["id"] for t, _ in failures}
+                leftovers = [t for t in pending if t["id"] not in done_ids and t["id"] not in failed_ids and t["id"] not in {x["id"] for x in wave}]
+                # wave tasks that failed are dropped in favor of replan
+                pending = leftovers + [
+                    {
+                        "id": t.id,
+                        "goal": t.goal,
+                        "allowed_files": t.allowed_files,
+                        "verify_command": t.verify_command,
+                        "depends_on": t.depends_on,
+                        "status": "READY",
+                    }
+                    for t in new_tasks
+                ]
+                # persist updated remaining task set + successful statuses
+                persisted = []
+                for r in all_results:
+                    # reconstruct minimal success entries from store
+                    pass
+                existing = self.store.list_tasks(project_id)
+                kept = [t for t in existing if t["id"] in done_ids]
+                for t in kept:
+                    t["status"] = "IMPLEMENTED"
+                self.store.replace_tasks(project_id, kept + pending)
+                self.store.add_evidence(
+                    project_id,
+                    "replan",
+                    {"model": model, "new_tasks": [t["id"] for t in new_tasks], "fallback_errors": errors},
+                )
+                wave_idx += 1
+                continue
+            # remove completed wave from pending
+            done_wave = {t["id"] for t in wave}
+            pending = [t for t in pending if t["id"] not in done_wave]
+            wave_idx += 1
 
-        # Integration worktree: merge all task branches in dependency order
+        # Integration worktree: merge all successful task branches
         integration = Workspace(project["repo"], project_id, task_id="integration")
         if integration.path.exists():
             integration.remove()
         integration.create(base="HEAD")
         merged_branches = []
-        for wave in waves:
-            for t in wave:
-                branch = f"ma/{project_id}/{t['id']}"
-                integration.merge_branch(branch)
-                merged_branches.append(branch)
+        for r in all_results:
+            branch = r.get("branch") or f"ma/{project_id}/{r['task_id']}"
+            integration.merge_branch(branch)
+            merged_branches.append(branch)
         integration.commit(f"ma: integrate {project_id}")
         combined_diff = integration.diff()
-        # also include committed history as empty working tree; use merge-base style summary
         if not combined_diff.strip():
-            # after commit, working tree clean — store branch list as artifact
             combined_diff = "\n".join(f"merged {b}" for b in merged_branches) + "\n"
 
         artifact = json.dumps(
@@ -339,13 +412,19 @@ class Orchestrator:
                 "integration_branch": integration.branch,
                 "task_results": all_results,
                 "merged_branches": merged_branches,
+                "replans": self._replan_count,
+                "budget": self.budget.snapshot() if self.budget else None,
             },
             ensure_ascii=False,
             indent=2,
         )
         self.store.record_stage(project_id, "implementation", "multi-task", "per-task workers", artifact)
-        self.store.add_evidence(project_id, "implementation", {"tasks": len(all_results), "waves": len(waves), "integration": str(integration.path)})
-        return {"tasks": all_results, "waves": len(waves), "integration": str(integration.path)}
+        self.store.add_evidence(
+            project_id,
+            "implementation",
+            {"tasks": len(all_results), "waves": wave_idx, "integration": str(integration.path), "replans": self._replan_count},
+        )
+        return {"tasks": all_results, "waves": wave_idx, "integration": str(integration.path), "replans": self._replan_count}
 
     def audit(self, project_id: str):
         if self.store.next_stage(project_id) != "audit":
@@ -354,18 +433,22 @@ class Orchestrator:
         artifact = self.store.get_artifact(project_id, "audit")
         return require_approve(artifact)
 
-    def merge(self, project_id: str) -> dict:
+    def merge(self, project_id: str, *, push: bool = False, remote: str = "origin") -> dict:
         project = self.store.get_project(project_id)
         audit = self.store.get_artifact(project_id, "audit")
         require_approve(audit)
         integration = Workspace(project["repo"], project_id, task_id="integration")
         if integration.path.exists():
             result = integration.merge_into_repo(f"ma: {project_id} approved")
+            ws = integration
         else:
             workspace = Workspace(project["repo"], project_id)
             if not workspace.path.exists():
                 raise RuntimeError("worktree missing; cannot merge")
             result = workspace.merge_into_repo(f"ma: {project_id} approved")
+            ws = workspace
+        if push:
+            result["push"] = ws.push(remote=remote)
         self.store.add_evidence(project_id, "merge", result)
         return result
 
@@ -375,6 +458,8 @@ class Orchestrator:
         *,
         verify_command: str | None = None,
         merge: bool = False,
+        push: bool = False,
+        remote: str = "origin",
     ) -> dict:
         try:
             while True:
@@ -398,7 +483,11 @@ class Orchestrator:
                     self.audit(project_id)
                     continue
                 break
-            merge_info = self.merge(project_id) if merge else {"merged": False, "reason": "merge not requested"}
+            merge_info = (
+                self.merge(project_id, push=push, remote=remote)
+                if merge
+                else {"merged": False, "reason": "merge not requested"}
+            )
             project = self.store.get_project(project_id)
             return {
                 "project_id": project_id,
@@ -406,6 +495,8 @@ class Orchestrator:
                 "next_stage": self.store.next_stage(project_id),
                 "tasks": self.store.list_tasks(project_id),
                 "merge": merge_info,
+                "budget": self.budget.snapshot() if self.budget else None,
+                "replans": self._replan_count,
             }
         except Exception as exc:
             note = notify_failure(f"ma ship FAILED {project_id}: {type(exc).__name__}: {exc}")

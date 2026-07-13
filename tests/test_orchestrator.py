@@ -15,7 +15,7 @@ from ma.gates import GateError, require_model_content, require_command_success, 
 from ma.workspace import Workspace, extract_diff
 from ma.tasks import parse_task_dag, enforce_allowed_files, TaskSpecError, ready_waves
 from ma.orchestrator import Orchestrator
-from ma.locks import FileLockManager, FileLockError
+from ma.locks import FileLockManager, FileLockError, Budget, BudgetExceeded
 
 
 class FakeResponse:
@@ -187,13 +187,42 @@ APPROVED PLAN
 
 class LockTests(unittest.TestCase):
     def test_file_lock_conflict(self):
-        lm = FileLockManager()
-        lm.acquire("T1", ["a.py", "b.py"])
-        with self.assertRaises(FileLockError):
+        with tempfile.TemporaryDirectory() as d:
+            lm = FileLockManager(Path(d) / "locks.sqlite")
+            lm.acquire("T1", ["a.py", "b.py"])
+            with self.assertRaises(FileLockError):
+                lm.acquire("T2", ["b.py"])
+            lm.release("T1")
             lm.acquire("T2", ["b.py"])
-        lm.release("T1")
-        lm.acquire("T2", ["b.py"])
-        lm.release("T2")
+            lm.release("T2")
+            lm.close()
+
+    def test_cross_process_lock_via_shared_db(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "locks.sqlite"
+            a = FileLockManager(db)
+            b = FileLockManager(db)
+            a.acquire("T1", ["shared.py"], project_id="p1")
+            with self.assertRaises(FileLockError):
+                b.acquire("T2", ["shared.py"], project_id="p2")
+            a.release("T1")
+            b.acquire("T2", ["shared.py"], project_id="p2")
+            b.release("T2")
+            a.close()
+            b.close()
+
+
+class BudgetTests(unittest.TestCase):
+    def test_budget_blocks_extra_calls(self):
+        b = Budget(max_calls=1, max_tokens=10000)
+        b.charge(prompt="hi", content="ok", model="m")
+        with self.assertRaises(BudgetExceeded):
+            b.charge(prompt="again", content="x", model="m")
+
+    def test_budget_blocks_tokens(self):
+        b = Budget(max_tokens=5)
+        with self.assertRaises(BudgetExceeded):
+            b.charge(prompt="x" * 100, content="y" * 100, model="m")
 
 
 class FallbackTests(unittest.TestCase):

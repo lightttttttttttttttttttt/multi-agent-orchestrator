@@ -105,7 +105,6 @@ class Workspace:
         self.commit(message)
         if target == self.branch:
             return {"merged_into": target, "branch": self.branch, "mode": "already-on-branch"}
-        # Prefer no-ff so multi-task history is preserved; fall back to ff-only for single commits.
         try:
             self._run(
                 ["git", "merge", "--no-ff", "--no-edit", "-m", message, self.branch],
@@ -116,6 +115,11 @@ class Workspace:
             self._run(["git", "merge", "--ff-only", self.branch], cwd=self.repo)
             mode = "ff-only"
         return {"merged_into": target, "branch": self.branch, "mode": mode}
+
+    def push(self, remote: str = "origin", branch: str | None = None) -> dict:
+        target = branch or self.current_branch()
+        self._run(["git", "push", remote, target], cwd=self.repo)
+        return {"remote": remote, "branch": target, "pushed": True}
 
     def remove(self):
         if self.path.exists():
