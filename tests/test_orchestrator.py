@@ -225,6 +225,35 @@ class BudgetTests(unittest.TestCase):
             b.charge(prompt="x" * 100, content="y" * 100, model="m")
 
 
+class SecretTests(unittest.TestCase):
+    def test_secret_scan_blocks_openai_key_in_diff(self):
+        from ma.secrets import require_no_secrets, SecretScanError
+
+        bad = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@\n+key = 'sk-abcdefghijklmnopqrstuvwxyz0123456789'\n"
+        with self.assertRaises(SecretScanError):
+            require_no_secrets(bad)
+
+    def test_secret_scan_allows_clean_diff(self):
+        from ma.secrets import require_no_secrets
+
+        good = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@\n+def ok():\n+    return 1\n"
+        self.assertIn("def ok", require_no_secrets(good))
+
+
+class UsageTests(unittest.TestCase):
+    def test_usage_ledger_records_and_summarizes(self):
+        from ma.usage import UsageLedger
+
+        with tempfile.TemporaryDirectory() as d:
+            led = UsageLedger(Path(d) / "usage.sqlite")
+            led.record(model="nttcodex/deepseek-v4-pro", prompt="hi" * 20, content="ok" * 10, project_id="p1")
+            led.record(model="Ntt_Codex10tr/gpt-5.6-sol", prompt="plan" * 30, content="done" * 20, project_id="p1")
+            s = led.summary("p1")
+            self.assertEqual(s["total_calls"], 2)
+            self.assertGreater(s["total_cost_usd"], 0)
+            led.close()
+
+
 class FallbackTests(unittest.TestCase):
     def test_role_fallback_uses_second_model(self):
         class Client:

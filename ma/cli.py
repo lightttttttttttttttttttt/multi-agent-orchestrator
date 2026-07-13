@@ -9,8 +9,10 @@ from .locks import Budget, BudgetExceeded
 from .notify import notify_failure
 from .orchestrator import Orchestrator, load_9router_key
 from .router import NineRouterClient, RouterError
+from .secrets import SecretScanError
 from .store import TaskStore
 from .tasks import TaskSpecError
+from .usage import UsageLedger
 from .workspace import WorkspaceError
 
 
@@ -62,6 +64,9 @@ def parser() -> argparse.ArgumentParser:
     ship.add_argument("--max-tokens", type=int, default=None, help="budget: rough max tokens (chars/4)")
     ship.add_argument("--max-replans", type=int, default=1)
     ship.add_argument("--workers", type=int, default=2)
+
+    usage = sub.add_parser("usage")
+    usage.add_argument("project_id", nargs="?")
     return p
 
 
@@ -92,6 +97,13 @@ def main(argv=None) -> int:
                     ensure_ascii=False,
                 )
             )
+            return 0
+        if args.command == "usage":
+            ledger = UsageLedger()
+            try:
+                print(json.dumps(ledger.summary(args.project_id), indent=2, ensure_ascii=False))
+            finally:
+                ledger.close()
             return 0
 
         budget = None
@@ -154,7 +166,7 @@ def main(argv=None) -> int:
             )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
-    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded) as exc:
+    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError) as exc:
         note = notify_failure(f"ma {args.command} FAILED: {type(exc).__name__}: {exc}")
         print(f"MODEL FAILURE: {exc}")
         print(json.dumps({"notify": note}, ensure_ascii=False))

@@ -12,8 +12,10 @@ from .gates import require_approve, require_command_success, require_model_conte
 from .locks import Budget, BudgetExceeded, FileLockManager
 from .notify import notify_failure
 from .router import NineRouterClient, RouterError
+from .secrets import SecretScanError, require_no_secrets
 from .store import TaskStore
 from .tasks import enforce_allowed_files, parse_task_dag, ready_waves
+from .usage import UsageLedger
 from .workspace import Workspace, extract_diff
 
 DEFAULT_MODELS = {
@@ -77,6 +79,7 @@ class Orchestrator:
         max_workers: int = 2,
         budget: Budget | None = None,
         max_replans: int = 1,
+        usage: UsageLedger | None = None,
     ):
         self.store = store
         self.client = client
@@ -87,10 +90,12 @@ class Orchestrator:
         if budget is not None and getattr(client, "budget", None) is None:
             client.budget = budget
         self.max_replans = max_replans
+        self.usage = usage or UsageLedger()
         self.file_locks = FileLockManager()
         self._replan_count = 0
+        self._project_for_usage: str | None = None
 
-    def _call_role(self, role: str, prompt: str, system: str):
+    def _call_role(self, role: str, prompt: str, system: str, *, project_id: str | None = None):
         chain = self.fallbacks.get(role) or [self.models[role]]
         seen, models = set(), []
         for m in chain:
@@ -101,6 +106,14 @@ class Orchestrator:
         for model in models:
             try:
                 result = self.client.call(model, prompt, system=system)
+                if self.usage is not None:
+                    self.usage.record(
+                        model=model,
+                        prompt=system + "\n" + prompt,
+                        content=result.content,
+                        project_id=project_id or self._project_for_usage,
+                        meta={"role": role, "raw": result.raw, "latency_ms": result.latency_ms},
+                    )
                 return result, model, errors
             except RouterError as exc:
                 errors.append(str(exc))
@@ -120,7 +133,7 @@ class Orchestrator:
         project = self.store.get_project(project_id)
         context = self._context(project_id, stage)
         prompt = f"PROJECT GOAL:\n{project['goal']}\n\nREPOSITORY:\n{project['repo']}\n\nCONTEXT:\n{context}"
-        result, model, fallback_errors = self._call_role(stage, prompt, SYSTEMS[stage])
+        result, model, fallback_errors = self._call_role(stage, prompt, SYSTEMS[stage], project_id=project_id)
         artifact = require_model_content(result.content)
         self.store.record_stage(project_id, stage, model, prompt, artifact)
         self.store.add_evidence(
@@ -230,11 +243,21 @@ class Orchestrator:
                 ):
                     try:
                         result = self.client.call(model, attempt_prompt, system=SYSTEMS["implementation"])
+                        if self.usage is not None:
+                            self.usage.record(
+                                model=model,
+                                prompt=SYSTEMS["implementation"] + "\n" + attempt_prompt,
+                                content=result.content,
+                                project_id=project_id,
+                                meta={"role": "implementation", "task_id": task_id, "raw": result.raw},
+                            )
                         patch = extract_diff(require_model_content(result.content))
+                        require_no_secrets(patch)
                         workspace.apply_patch(patch)
                         diff = workspace.diff()
                         if not diff.strip():
                             raise RuntimeError("worker patch produced no repository diff")
+                        require_no_secrets(diff)
                         if allowed and allowed != ["."]:
                             enforce_allowed_files(diff, allowed)
                         chosen = (model, result, diff, tag, last_errors)
@@ -461,6 +484,7 @@ class Orchestrator:
         push: bool = False,
         remote: str = "origin",
     ) -> dict:
+        self._project_for_usage = project_id
         try:
             while True:
                 stage = self.store.next_stage(project_id)
@@ -497,6 +521,7 @@ class Orchestrator:
                 "merge": merge_info,
                 "budget": self.budget.snapshot() if self.budget else None,
                 "replans": self._replan_count,
+                "usage": self.usage.summary(project_id) if self.usage else None,
             }
         except Exception as exc:
             note = notify_failure(f"ma ship FAILED {project_id}: {type(exc).__name__}: {exc}")
