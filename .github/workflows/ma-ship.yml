@@ -1,0 +1,55 @@
+name: ma-ship
+on:
+  workflow_dispatch:
+    inputs:
+      goal:
+        description: Ship goal
+        required: true
+        type: string
+      verify:
+        description: Verify command
+        required: true
+        default: python -m unittest discover -s tests -v
+        type: string
+      merge:
+        description: Merge after APPROVE
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ship:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ma
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e C:/Users/OS/multi-agent-orchestrator
+        shell: bash
+        # In CI clone, prefer local path if action is vendored; otherwise install from this repo path.
+        # For external repos, copy ma package or install from a release URL.
+
+      - name: Doctor
+        run: ma doctor --no-probe
+        shell: bash
+        env:
+          # Provide 9Router access from runner secrets/env if remote.
+          # Local self-hosted runners can use host 9Router.
+          true: true
+
+      - name: Ship
+        run: |
+          GOAL="${{ github.event.inputs.goal || github.event.pull_request.title }}"
+          VERIFY="${{ github.event.inputs.verify || 'python -m unittest discover -s tests -v' }}"
+          EXTRA=""
+          if [ "${{ github.event.inputs.merge }}" = "true" ]; then EXTRA="--merge"; fi
+          ma ship "$GITHUB_WORKSPACE" "$GOAL" --verify "$VERIFY" --workers 0 $EXTRA
+        shell: bash

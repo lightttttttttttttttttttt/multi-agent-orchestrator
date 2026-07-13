@@ -345,20 +345,19 @@ class EventsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
-            # monkeypatch event base via explicit path helpers
             pid = "projtest"
-            # temporarily point helpers by writing using custom base wrappers
-            p = events.events_path(pid, base)
-            events.emit.__defaults__  # keep linter quiet
-            # write via patched functions
             old_events = events.events_path
             old_cancel = events.cancel_path
+            old_pid = events.pid_path
             events.events_path = lambda project_id, base_dir=base: old_events(project_id, base_dir)  # type: ignore
             events.cancel_path = lambda project_id, base_dir=base: old_cancel(project_id, base_dir)  # type: ignore
+            events.pid_path = lambda project_id, base_dir=base: old_pid(project_id, base_dir)  # type: ignore
             try:
                 events.clear_cancel(pid)
+                events.clear_pid(pid)
                 events.emit(pid, "ship_start")
-                events.request_cancel(pid)
+                out = events.request_cancel(pid, hard=False)
+                self.assertTrue(Path(out["cancel"]).exists())
                 with self.assertRaises(events.CancelledError):
                     events.check_cancel(pid)
                 items = list(events.tail_events(pid, follow=False))
@@ -368,6 +367,41 @@ class EventsTests(unittest.TestCase):
             finally:
                 events.events_path = old_events  # type: ignore
                 events.cancel_path = old_cancel  # type: ignore
+                events.pid_path = old_pid  # type: ignore
+
+    def test_pid_write_and_clear(self):
+        from ma import events
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            old = events.pid_path
+            events.pid_path = lambda project_id, base_dir=base: old(project_id, base_dir)  # type: ignore
+            try:
+                events.write_pid("p1", 12345)
+                self.assertEqual(events.read_pid("p1"), 12345)
+                events.clear_pid("p1")
+                self.assertIsNone(events.read_pid("p1"))
+            finally:
+                events.pid_path = old  # type: ignore
+
+
+class QueueTests(unittest.TestCase):
+    def test_enqueue_claim_complete(self):
+        from ma.queue import JobQueue
+
+        with tempfile.TemporaryDirectory() as d:
+            q = JobQueue(Path(d) / "queue.sqlite")
+            jid = q.enqueue(repo=d, goal="do thing", verify_command="pytest -q")
+            job = q.claim("worker-1")
+            self.assertIsNotNone(job)
+            self.assertEqual(job["id"], jid)
+            self.assertEqual(job["status"], "RUNNING")
+            q.complete(jid, {"ok": True})
+            got = q.get(jid)
+            self.assertEqual(got["status"], "DONE")
+            self.assertEqual(got["result"]["ok"], True)
+            self.assertIsNone(q.claim("worker-2"))
+            q.close()
 
 
 class GateTests(unittest.TestCase):

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
+import time
+import traceback
 from pathlib import Path
 
 from .events import CancelledError, request_cancel, tail_events
@@ -10,6 +13,7 @@ from .locks import Budget, BudgetExceeded
 from .notify import notify_failure
 from .ops import clean_project, doctor
 from .orchestrator import Orchestrator, load_9router_key
+from .queue import JobQueue, QueueError
 from .report import export_markdown_report
 from .router import NineRouterClient, RouterError
 from .secrets import SecretScanError
@@ -60,19 +64,19 @@ def parser() -> argparse.ArgumentParser:
     ship.add_argument("--name", default="ship")
     ship.add_argument("--verify", default=None)
     ship.add_argument("--merge", action="store_true")
-    ship.add_argument("--push", action="store_true", help="push after merge (implies --merge)")
+    ship.add_argument("--push", action="store_true")
     ship.add_argument("--remote", default="origin")
     ship.add_argument("--project-id", default=None)
     ship.add_argument("--max-calls", type=int, default=None)
     ship.add_argument("--max-tokens", type=int, default=None)
     ship.add_argument("--max-replans", type=int, default=1)
-    ship.add_argument("--workers", type=int, default=0, help="max parallel workers; 0=auto up to 4")
+    ship.add_argument("--workers", type=int, default=0)
 
     usage = sub.add_parser("usage")
     usage.add_argument("project_id", nargs="?")
 
     doc = sub.add_parser("doctor")
-    doc.add_argument("--no-probe", action="store_true", help="skip live model probes")
+    doc.add_argument("--no-probe", action="store_true")
     doc.add_argument("--timeout", type=int, default=15)
 
     clean = sub.add_parser("clean")
@@ -85,10 +89,27 @@ def parser() -> argparse.ArgumentParser:
     watch = sub.add_parser("watch")
     watch.add_argument("project_id")
     watch.add_argument("--follow", action="store_true")
-    watch.add_argument("--idle", type=float, default=30.0, help="follow idle timeout seconds")
+    watch.add_argument("--idle", type=float, default=30.0)
 
     cancel = sub.add_parser("cancel")
     cancel.add_argument("project_id")
+    cancel.add_argument("--soft", action="store_true", help="marker only, do not kill process")
+
+    enqueue = sub.add_parser("enqueue")
+    enqueue.add_argument("repo")
+    enqueue.add_argument("goal")
+    enqueue.add_argument("--verify", default=None)
+
+    qlist = sub.add_parser("queue")
+    qlist.add_argument("--limit", type=int, default=20)
+
+    qget = sub.add_parser("job")
+    qget.add_argument("job_id")
+
+    worker = sub.add_parser("worker")
+    worker.add_argument("--id", default=None, help="worker id")
+    worker.add_argument("--once", action="store_true")
+    worker.add_argument("--poll", type=float, default=2.0)
     return p
 
 
@@ -100,25 +121,13 @@ def main(argv=None) -> int:
             repo = str(Path(args.repo).resolve())
             if not Path(repo).is_dir():
                 raise SystemExit(f"repo does not exist: {repo}")
-            project_id = store.create_project(args.name, repo, args.goal)
-            print(project_id)
+            print(store.create_project(args.name, repo, args.goal))
             return 0
         if args.command == "status":
-            result = store.get_project(args.project_id) if args.project_id else store.list_projects()
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            print(json.dumps(store.get_project(args.project_id) if args.project_id else store.list_projects(), indent=2, ensure_ascii=False))
             return 0
         if args.command == "show":
-            print(
-                json.dumps(
-                    {
-                        "project": store.get_project(args.project_id),
-                        "stages": store.list_stages(args.project_id),
-                        "tasks": store.list_tasks(args.project_id),
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            print(json.dumps({"project": store.get_project(args.project_id), "stages": store.list_stages(args.project_id), "tasks": store.list_tasks(args.project_id)}, indent=2, ensure_ascii=False))
             return 0
         if args.command == "usage":
             ledger = UsageLedger()
@@ -132,13 +141,7 @@ def main(argv=None) -> int:
             print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0 if report["ok"] else 2
         if args.command == "clean":
-            print(
-                json.dumps(
-                    clean_project(store, args.project_id, delete_branches=args.delete_branches),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            print(json.dumps(clean_project(store, args.project_id, delete_branches=args.delete_branches), indent=2, ensure_ascii=False))
             return 0
         if args.command == "report":
             ledger = UsageLedger()
@@ -146,17 +149,64 @@ def main(argv=None) -> int:
                 usage = ledger.summary(args.project_id)
             finally:
                 ledger.close()
-            path = export_markdown_report(store, args.project_id, usage)
-            print(json.dumps({"report": str(path)}, indent=2))
+            print(json.dumps({"report": str(export_markdown_report(store, args.project_id, usage))}, indent=2))
             return 0
         if args.command == "watch":
             for ev in tail_events(args.project_id, follow=args.follow, max_idle=args.idle):
                 print(json.dumps(ev, ensure_ascii=False), flush=True)
             return 0
         if args.command == "cancel":
-            path = request_cancel(args.project_id)
-            print(json.dumps({"cancel": str(path), "project_id": args.project_id}, indent=2))
+            print(json.dumps(request_cancel(args.project_id, hard=not args.soft), indent=2))
             return 0
+        if args.command == "enqueue":
+            q = JobQueue()
+            try:
+                job_id = q.enqueue(repo=str(Path(args.repo).resolve()), goal=args.goal, verify_command=args.verify)
+                print(json.dumps({"job_id": job_id}, indent=2))
+            finally:
+                q.close()
+            return 0
+        if args.command == "queue":
+            q = JobQueue()
+            try:
+                print(json.dumps(q.list(args.limit), indent=2, ensure_ascii=False))
+            finally:
+                q.close()
+            return 0
+        if args.command == "job":
+            q = JobQueue()
+            try:
+                print(json.dumps(q.get(args.job_id), indent=2, ensure_ascii=False))
+            finally:
+                q.close()
+            return 0
+        if args.command == "worker":
+            worker_id = args.id or f"{socket.gethostname()}-{int(time.time())}"
+            q = JobQueue()
+            try:
+                while True:
+                    job = q.claim(worker_id)
+                    if not job:
+                        if args.once:
+                            print(json.dumps({"worker": worker_id, "claimed": None}))
+                            return 0
+                        time.sleep(args.poll)
+                        continue
+                    print(json.dumps({"worker": worker_id, "claimed": job["id"], "repo": job["repo"]}, flush=True))
+                    try:
+                        client = NineRouterClient("http://127.0.0.1:20128", load_9router_key(), timeout=15, attempts=3)
+                        orch = Orchestrator(store, client, max_workers=0)
+                        pid = store.create_project(f"job-{job['id']}", job["repo"], job["goal"])
+                        result = orch.ship(pid, verify_command=job.get("verify_command"), merge=False)
+                        q.complete(job["id"], result)
+                        print(json.dumps({"worker": worker_id, "job": job["id"], "status": "DONE"}, flush=True))
+                    except Exception as exc:
+                        q.fail(job["id"], f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1000:]}")
+                        print(json.dumps({"worker": worker_id, "job": job["id"], "status": "FAILED", "error": str(exc)}, flush=True))
+                    if args.once:
+                        return 0
+            finally:
+                q.close()
 
         budget = None
         max_replans = 1
@@ -166,24 +216,11 @@ def main(argv=None) -> int:
             max_replans = args.max_replans
             workers = args.workers
 
-        client = NineRouterClient(
-            "http://127.0.0.1:20128",
-            load_9router_key(),
-            timeout=15,
-            attempts=3,
-            budget=budget,
-        )
-        orchestrator = Orchestrator(
-            store,
-            client,
-            max_workers=workers if args.command == "ship" else 2,
-            budget=budget,
-            max_replans=max_replans,
-        )
+        client = NineRouterClient("http://127.0.0.1:20128", load_9router_key(), timeout=15, attempts=3, budget=budget)
+        orchestrator = Orchestrator(store, client, max_workers=workers if args.command == "ship" else 2, budget=budget, max_replans=max_replans)
 
         if args.command == "run":
-            result = orchestrator.run(args.project_id, until=args.until)
-            print(json.dumps(result.__dict__, indent=2))
+            print(json.dumps(orchestrator.run(args.project_id, until=args.until).__dict__, indent=2))
             return 0
         if args.command == "verify":
             print(json.dumps(orchestrator.verify(args.project_id, args.command_line), indent=2, ensure_ascii=False))
@@ -195,30 +232,17 @@ def main(argv=None) -> int:
             print(orchestrator.audit(args.project_id))
             return 0
         if args.command == "merge":
-            print(
-                json.dumps(
-                    orchestrator.merge(args.project_id, push=args.push, remote=args.remote),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            print(json.dumps(orchestrator.merge(args.project_id, push=args.push, remote=args.remote), indent=2, ensure_ascii=False))
             return 0
         if args.command == "ship":
             repo = str(Path(args.repo).resolve())
             if not Path(repo).is_dir():
                 raise SystemExit(f"repo does not exist: {repo}")
             pid = args.project_id or store.create_project(args.name, repo, args.goal)
-            do_merge = args.merge or args.push
-            result = orchestrator.ship(
-                pid,
-                verify_command=args.verify,
-                merge=do_merge,
-                push=args.push,
-                remote=args.remote,
-            )
+            result = orchestrator.ship(pid, verify_command=args.verify, merge=args.merge or args.push, push=args.push, remote=args.remote)
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0
-    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError, CancelledError) as exc:
+    except (RouterError, GateError, WorkspaceError, TaskSpecError, BudgetExceeded, SecretScanError, CancelledError, QueueError) as exc:
         note = notify_failure(f"ma {args.command} FAILED: {type(exc).__name__}: {exc}")
         print(f"MODEL FAILURE: {exc}")
         print(json.dumps({"notify": note}, ensure_ascii=False))

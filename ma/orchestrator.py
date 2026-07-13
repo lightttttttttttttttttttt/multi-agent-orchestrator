@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .defaults import DEFAULT_FALLBACKS, DEFAULT_MODELS, SYSTEMS
-from .events import CancelledError, check_cancel, clear_cancel, emit
+from .events import CancelledError, check_cancel, clear_cancel, clear_pid, emit, write_pid
 from .gates import require_approve, require_command_success, require_model_content
 from .locks import Budget, BudgetExceeded, FileLockManager
 from .notify import notify_failure
@@ -483,6 +483,7 @@ class Orchestrator:
     ) -> dict:
         self._project_for_usage = project_id
         clear_cancel(project_id)
+        write_pid(project_id)
         emit(project_id, "ship_start", merge=merge, push=push)
         try:
             if preflight:
@@ -541,14 +542,17 @@ class Orchestrator:
             }
             emit(project_id, "ship_done", status=project["status"], report=str(report_path))
             clear_cancel(project_id)
+            clear_pid(project_id)
             return result
         except CancelledError:
             self.store.add_evidence(project_id, "cancelled", {"project_id": project_id})
+            clear_pid(project_id)
             raise
         except Exception as exc:
             emit(project_id, "ship_failed", error=str(exc))
             note = notify_failure(f"ma ship FAILED {project_id}: {type(exc).__name__}: {exc}")
             self.store.add_evidence(project_id, "failure", {"error": str(exc), "notify": note})
+            clear_pid(project_id)
             raise
 
     def _context(self, project_id: str, stage: str) -> str:
