@@ -16,6 +16,7 @@ from ma.workspace import Workspace, extract_diff
 from ma.tasks import parse_task_dag, enforce_allowed_files, TaskSpecError, ready_waves
 from ma.orchestrator import Orchestrator
 from ma.locks import FileLockManager, FileLockError, Budget, BudgetExceeded
+import subprocess
 
 
 class FakeResponse:
@@ -229,7 +230,8 @@ class SecretTests(unittest.TestCase):
     def test_secret_scan_blocks_openai_key_in_diff(self):
         from ma.secrets import require_no_secrets, SecretScanError
 
-        bad = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@\n+key = 'sk-abcdefghijklmnopqrstuvwxyz0123456789'\n"
+        fake = "sk-" + ("a" * 32)
+        bad = f"diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@\n+key = '{fake}'\n"
         with self.assertRaises(SecretScanError):
             require_no_secrets(bad)
 
@@ -252,6 +254,38 @@ class UsageTests(unittest.TestCase):
             self.assertEqual(s["total_calls"], 2)
             self.assertGreater(s["total_cost_usd"], 0)
             led.close()
+
+
+class OpsTests(unittest.TestCase):
+    def test_workers_for_wave_autoscale(self):
+        from ma.ops import workers_for_wave
+
+        self.assertEqual(workers_for_wave(1, 0), 1)
+        self.assertEqual(workers_for_wave(3, 0), 3)
+        self.assertEqual(workers_for_wave(10, 0), 4)
+        self.assertEqual(workers_for_wave(10, 2), 2)
+
+    def test_clean_removes_worktree(self):
+        from ma.ops import clean_project
+
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "t@l"], cwd=repo, check=True)
+            (repo / "a.py").write_text("x\n")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "i"], cwd=repo, check=True)
+            store = TaskStore(Path(d) / "state.sqlite")
+            pid = store.create_project("c", str(repo), "g")
+            ws = Workspace(repo, pid, task_id="T1")
+            ws.create()
+            self.assertTrue(ws.path.exists())
+            out = clean_project(store, pid)
+            self.assertFalse(ws.path.exists())
+            self.assertTrue(any("T1" in p for p in out["removed_worktrees"]))
+            store.close()
 
 
 class FallbackTests(unittest.TestCase):

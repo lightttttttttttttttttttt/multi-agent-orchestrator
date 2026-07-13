@@ -2,55 +2,43 @@
 
 Local multi-model software factory over 9Router.
 
-## Capabilities
+## Commands
 
-- Role routing + fallbacks (Sol / Grok / DeepSeek / Gemini)
-- 15s × 3 timeout brake
-- SQLite durable state
-- Task DAG, allowed_files, dependency waves
+```bash
+ma doctor                 # preflight + model probe
+ma doctor --no-probe
+ma ship C:/repo "goal" --verify "pytest -q" --workers 0   # 0=auto up to 4
+ma ship ... --merge / --push
+ma usage [PROJECT_ID]
+ma clean PROJECT_ID [--delete-branches]
+ma show PROJECT_ID
+```
+
+## Features
+
+- Role routing + fallbacks
+- 15s × 3 timeout
+- Task DAG / allowed_files / waves
 - Per-task worktrees + integration worktree
 - Cross-process file locks
-- Parallel workers
-- Secret scan on patches/diffs
-- Usage/cost ledger (`ma usage`)
-- Budget caps (`--max-calls`, `--max-tokens`)
-- Replan on task failure
+- Auto worker scaling by wave size
+- Secret scan
+- Usage/cost ledger
+- Budget caps
+- Replan on failure
 - Machine verify + Sol APPROVE
-- Optional merge / push
+- Optional merge/push
 - Telegram fail notify
+- doctor / clean ops
 
 ## Install
 
 ```bash
-cd C:/Users/OS/multi-agent-orchestrator
-python -m pip install -e .
+python -m pip install -e C:/Users/OS/multi-agent-orchestrator
 ```
-
-## Use
-
-```bash
-ma ship C:/repo "goal" --verify "pytest -q" --workers 2 --max-calls 40 --max-tokens 200000
-ma ship ... --merge
-ma ship ... --push
-ma usage
-ma usage PROJECT_ID
-ma show PROJECT_ID
-```
-
-## Safety
-
-- Secrets in added diff lines / blocked paths → fail
-- Out-of-scope files → fail
-- Tests fail → stop
-- No APPROVE → no merge
-- No push unless `--push`
 
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
-
-## Boundary
-
-Not: multi-machine workers, real provider invoice reconciliation, autoscaling pools.

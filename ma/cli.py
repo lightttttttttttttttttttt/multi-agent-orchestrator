@@ -7,6 +7,7 @@ from pathlib import Path
 from .gates import GateError
 from .locks import Budget, BudgetExceeded
 from .notify import notify_failure
+from .ops import clean_project, doctor
 from .orchestrator import Orchestrator, load_9router_key
 from .router import NineRouterClient, RouterError
 from .secrets import SecretScanError
@@ -60,13 +61,21 @@ def parser() -> argparse.ArgumentParser:
     ship.add_argument("--push", action="store_true", help="push after merge (implies --merge)")
     ship.add_argument("--remote", default="origin")
     ship.add_argument("--project-id", default=None)
-    ship.add_argument("--max-calls", type=int, default=None, help="budget: max model calls")
-    ship.add_argument("--max-tokens", type=int, default=None, help="budget: rough max tokens (chars/4)")
+    ship.add_argument("--max-calls", type=int, default=None)
+    ship.add_argument("--max-tokens", type=int, default=None)
     ship.add_argument("--max-replans", type=int, default=1)
-    ship.add_argument("--workers", type=int, default=2)
+    ship.add_argument("--workers", type=int, default=0, help="max parallel workers; 0=auto up to 4")
 
     usage = sub.add_parser("usage")
     usage.add_argument("project_id", nargs="?")
+
+    doc = sub.add_parser("doctor")
+    doc.add_argument("--no-probe", action="store_true", help="skip live model probes")
+    doc.add_argument("--timeout", type=int, default=15)
+
+    clean = sub.add_parser("clean")
+    clean.add_argument("project_id")
+    clean.add_argument("--delete-branches", action="store_true")
     return p
 
 
@@ -105,10 +114,23 @@ def main(argv=None) -> int:
             finally:
                 ledger.close()
             return 0
+        if args.command == "doctor":
+            report = doctor(probe_models=not args.no_probe, timeout=args.timeout)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0 if report["ok"] else 2
+        if args.command == "clean":
+            print(
+                json.dumps(
+                    clean_project(store, args.project_id, delete_branches=args.delete_branches),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
 
         budget = None
         max_replans = 1
-        workers = 2
+        workers = 0
         if args.command == "ship":
             budget = Budget(max_calls=args.max_calls, max_tokens=args.max_tokens)
             max_replans = args.max_replans
@@ -124,7 +146,7 @@ def main(argv=None) -> int:
         orchestrator = Orchestrator(
             store,
             client,
-            max_workers=workers,
+            max_workers=workers if args.command == "ship" else 2,
             budget=budget,
             max_replans=max_replans,
         )
