@@ -19,29 +19,43 @@ def extract_diff(text: str) -> str:
 
 
 class Workspace:
-    def __init__(self, repo: str | Path, project_id: str):
+    def __init__(self, repo: str | Path, project_id: str, task_id: str | None = None):
         self.repo = Path(repo).resolve()
         self.project_id = project_id
-        self.path = self.repo.parent / f"{self.repo.name}-ma-{project_id}"
-        self.branch = f"ma/{project_id}"
+        self.task_id = task_id
+        suffix = f"{project_id}-{task_id}" if task_id else project_id
+        self.path = self.repo.parent / f"{self.repo.name}-ma-{suffix}"
+        self.branch = f"ma/{project_id}/{task_id}" if task_id else f"ma/{project_id}"
 
-    def _run(self, args: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        args: list[str],
+        *,
+        cwd: Path | None = None,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess:
         result = subprocess.run(args, cwd=cwd or self.repo, input=input_text, text=True, capture_output=True)
         if result.returncode:
             raise WorkspaceError(f"{' '.join(args)} failed: {(result.stderr or result.stdout).strip()}")
         return result
 
-    def create(self) -> Path:
+    def create(self, *, base: str = "HEAD") -> Path:
         if not (self.repo / ".git").exists():
             raise WorkspaceError(f"not a git repository: {self.repo}")
         if self.path.exists():
             return self.path
-        branch_exists = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{self.branch}"],
-            cwd=self.repo,
-        ).returncode == 0
+        branch_exists = (
+            subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{self.branch}"],
+                cwd=self.repo,
+            ).returncode
+            == 0
+        )
         args = ["git", "worktree", "add"]
-        args += [str(self.path), self.branch] if branch_exists else ["-b", self.branch, str(self.path), "HEAD"]
+        if branch_exists:
+            args += [str(self.path), self.branch]
+        else:
+            args += ["-b", self.branch, str(self.path), base]
         self._run(args)
         return self.path
 
@@ -69,24 +83,39 @@ class Workspace:
         return self._run(["git", "diff", "--binary"], cwd=self.path).stdout
 
     def commit(self, message: str):
+        status = self._run(["git", "status", "--porcelain"], cwd=self.path).stdout.strip()
+        if not status:
+            return
         self._run(["git", "add", "-A"], cwd=self.path)
-        # if nothing staged, git commit fails; that's OK to surface
         self._run(["git", "commit", "-m", message], cwd=self.path)
+
+    def reset_hard(self):
+        if self.path.exists():
+            subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=self.path, capture_output=True)
+            subprocess.run(["git", "clean", "-fd"], cwd=self.path, capture_output=True)
 
     def current_branch(self) -> str:
         return self._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo).stdout.strip()
 
+    def merge_branch(self, branch: str, *, cwd: Path | None = None):
+        self._run(["git", "merge", "--no-ff", "--no-edit", "-m", f"ma: merge {branch}", branch], cwd=cwd or self.path)
+
     def merge_into_repo(self, message: str = "ma: merge approved worktree") -> dict:
-        """Commit worktree branch, then fast-forward merge into the repo's current branch."""
         target = self.current_branch()
-        if target == self.branch:
-            # already on feature branch in main workdir; just commit worktree tip if needed
-            self.commit(message)
-            return {"merged_into": target, "branch": self.branch, "mode": "already-on-branch"}
         self.commit(message)
-        # merge feature branch into current branch of main repo
-        self._run(["git", "merge", "--ff-only", self.branch], cwd=self.repo)
-        return {"merged_into": target, "branch": self.branch, "mode": "ff-only"}
+        if target == self.branch:
+            return {"merged_into": target, "branch": self.branch, "mode": "already-on-branch"}
+        # Prefer no-ff so multi-task history is preserved; fall back to ff-only for single commits.
+        try:
+            self._run(
+                ["git", "merge", "--no-ff", "--no-edit", "-m", message, self.branch],
+                cwd=self.repo,
+            )
+            mode = "no-ff"
+        except WorkspaceError:
+            self._run(["git", "merge", "--ff-only", self.branch], cwd=self.repo)
+            mode = "ff-only"
+        return {"merged_into": target, "branch": self.branch, "mode": mode}
 
     def remove(self):
         if self.path.exists():

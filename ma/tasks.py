@@ -55,7 +55,6 @@ def parse_task_dag(text: str) -> list[TaskSpec]:
         for dep in t.depends_on:
             if dep not in ids:
                 raise TaskSpecError(f"task {t.id} depends on missing {dep}")
-    # cycle check
     visiting, done = set(), set()
 
     def visit(tid: str):
@@ -79,7 +78,6 @@ def changed_files_from_diff(diff: str) -> list[str]:
     files = []
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            # diff --git a/path b/path
             parts = line.split()
             if len(parts) >= 4:
                 path = parts[3][2:] if parts[3].startswith("b/") else parts[3]
@@ -96,3 +94,46 @@ def enforce_allowed_files(diff: str, allowed: list[str]) -> list[str]:
     if illegal:
         raise TaskSpecError(f"patch touches files outside allowed set: {illegal}")
     return changed
+
+
+def files_overlap(a: list[str], b: list[str]) -> bool:
+    return bool(set(a) & set(b))
+
+
+def ready_waves(tasks: list[dict]) -> list[list[dict]]:
+    """
+    Partition tasks into execution waves.
+    A task is ready when all depends_on are done in previous waves.
+    Within a wave, tasks must not share allowed_files (file lock).
+    """
+    remaining = {t["id"]: dict(t) for t in tasks}
+    done: set[str] = set()
+    waves: list[list[dict]] = []
+    while remaining:
+        candidates = [
+            t
+            for t in remaining.values()
+            if all(dep in done for dep in t.get("depends_on", []))
+        ]
+        if not candidates:
+            raise TaskSpecError(f"deadlock in task DAG; remaining={list(remaining)}")
+        # stable order by id
+        candidates.sort(key=lambda x: x["id"])
+        wave: list[dict] = []
+        locked: set[str] = set()
+        deferred = []
+        for t in candidates:
+            files = set(t.get("allowed_files") or [])
+            if files & locked:
+                deferred.append(t)
+                continue
+            wave.append(t)
+            locked |= files
+        if not wave:
+            # all candidates conflict; run first alone
+            wave = [candidates[0]]
+        for t in wave:
+            remaining.pop(t["id"])
+            done.add(t["id"])
+        waves.append(wave)
+    return waves

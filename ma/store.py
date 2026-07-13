@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -13,7 +14,8 @@ class TaskStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path)
+        self._lock = threading.RLock()
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(
             """
@@ -36,92 +38,111 @@ class TaskStore:
         self.db.commit()
 
     def close(self):
-        self.db.close()
+        with self._lock:
+            self.db.close()
 
     def create_project(self, name: str, repo: str, goal: str) -> str:
         project_id = uuid.uuid4().hex[:12]
         now = int(time.time())
-        self.db.execute(
-            "INSERT INTO projects VALUES(?,?,?,?,?,?,?)",
-            (project_id, name, repo, goal, "INTAKE", now, now),
-        )
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO projects VALUES(?,?,?,?,?,?,?)",
+                (project_id, name, repo, goal, "INTAKE", now, now),
+            )
+            self.db.commit()
         return project_id
 
     def get_project(self, project_id: str) -> dict:
-        row = self.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        with self._lock:
+            row = self.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         if not row:
             raise KeyError(project_id)
         return dict(row)
 
     def next_stage(self, project_id: str) -> str | None:
-        completed = {r[0] for r in self.db.execute("SELECT stage FROM stages WHERE project_id=?", (project_id,))}
+        with self._lock:
+            completed = {r[0] for r in self.db.execute("SELECT stage FROM stages WHERE project_id=?", (project_id,))}
         return next((stage for stage in STAGES if stage not in completed), None)
 
     def record_stage(self, project_id: str, stage: str, model: str, prompt: str, artifact: str):
-        expected = self.next_stage(project_id)
-        if stage != expected:
-            raise ValueError(f"invalid transition: expected {expected}, got {stage}")
-        now = int(time.time())
-        self.db.execute(
-            "INSERT INTO stages(project_id,stage,model,prompt,artifact,created_at) VALUES(?,?,?,?,?,?)",
-            (project_id, stage, model, prompt, artifact, now),
-        )
-        status = "DONE" if stage == STAGES[-1] else stage.upper()
-        self.db.execute("UPDATE projects SET status=?,updated_at=? WHERE id=?", (status, now, project_id))
-        self.db.commit()
+        with self._lock:
+            expected = next(
+                (
+                    s
+                    for s in STAGES
+                    if s
+                    not in {r[0] for r in self.db.execute("SELECT stage FROM stages WHERE project_id=?", (project_id,))}
+                ),
+                None,
+            )
+            if stage != expected:
+                raise ValueError(f"invalid transition: expected {expected}, got {stage}")
+            now = int(time.time())
+            self.db.execute(
+                "INSERT INTO stages(project_id,stage,model,prompt,artifact,created_at) VALUES(?,?,?,?,?,?)",
+                (project_id, stage, model, prompt, artifact, now),
+            )
+            status = "DONE" if stage == STAGES[-1] else stage.upper()
+            self.db.execute("UPDATE projects SET status=?,updated_at=? WHERE id=?", (status, now, project_id))
+            self.db.commit()
 
     def get_artifact(self, project_id: str, stage: str) -> str:
-        row = self.db.execute(
-            "SELECT artifact FROM stages WHERE project_id=? AND stage=?",
-            (project_id, stage),
-        ).fetchone()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT artifact FROM stages WHERE project_id=? AND stage=?",
+                (project_id, stage),
+            ).fetchone()
         return row[0] if row else ""
 
     def list_projects(self) -> list[dict]:
-        return [dict(row) for row in self.db.execute("SELECT * FROM projects ORDER BY updated_at DESC")]
+        with self._lock:
+            return [dict(row) for row in self.db.execute("SELECT * FROM projects ORDER BY updated_at DESC")]
 
     def list_stages(self, project_id: str) -> list[dict]:
-        return [
-            dict(row)
-            for row in self.db.execute(
-                "SELECT stage,model,artifact,created_at FROM stages WHERE project_id=? ORDER BY id",
-                (project_id,),
-            )
-        ]
+        with self._lock:
+            return [
+                dict(row)
+                for row in self.db.execute(
+                    "SELECT stage,model,artifact,created_at FROM stages WHERE project_id=? ORDER BY id",
+                    (project_id,),
+                )
+            ]
 
     def add_evidence(self, project_id: str, kind: str, data: dict):
-        self.db.execute(
-            "INSERT INTO evidence(project_id,kind,data,created_at) VALUES(?,?,?,?)",
-            (project_id, kind, json.dumps(data), int(time.time())),
-        )
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO evidence(project_id,kind,data,created_at) VALUES(?,?,?,?)",
+                (project_id, kind, json.dumps(data), int(time.time())),
+            )
+            self.db.commit()
 
     def replace_tasks(self, project_id: str, tasks: list[dict]):
-        self.db.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
-        now = int(time.time())
-        for t in tasks:
-            self.db.execute(
-                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    t["id"],
-                    project_id,
-                    t["goal"],
-                    json.dumps(t["allowed_files"]),
-                    t["verify_command"],
-                    json.dumps(t.get("depends_on", [])),
-                    t.get("status", "READY"),
-                    now,
-                    now,
-                ),
-            )
-        self.db.commit()
+        with self._lock:
+            self.db.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
+            now = int(time.time())
+            for t in tasks:
+                self.db.execute(
+                    "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        t["id"],
+                        project_id,
+                        t["goal"],
+                        json.dumps(t["allowed_files"]),
+                        t["verify_command"],
+                        json.dumps(t.get("depends_on", [])),
+                        t.get("status", "READY"),
+                        now,
+                        now,
+                    ),
+                )
+            self.db.commit()
 
     def list_tasks(self, project_id: str) -> list[dict]:
-        rows = self.db.execute(
-            "SELECT * FROM tasks WHERE project_id=? ORDER BY created_at, id",
-            (project_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM tasks WHERE project_id=? ORDER BY created_at, id",
+                (project_id,),
+            ).fetchall()
         out = []
         for row in rows:
             item = dict(row)
@@ -131,8 +152,9 @@ class TaskStore:
         return out
 
     def set_task_status(self, task_id: str, status: str):
-        self.db.execute(
-            "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-            (status, int(time.time()), task_id),
-        )
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                (status, int(time.time()), task_id),
+            )
+            self.db.commit()

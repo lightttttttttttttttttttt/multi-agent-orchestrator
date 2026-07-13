@@ -13,8 +13,9 @@ from ma.router import EmptyResponseError, NineRouterClient, RouterError
 from ma.store import TaskStore
 from ma.gates import GateError, require_model_content, require_command_success, require_approve
 from ma.workspace import Workspace, extract_diff
-from ma.tasks import parse_task_dag, enforce_allowed_files, TaskSpecError
+from ma.tasks import parse_task_dag, enforce_allowed_files, TaskSpecError, ready_waves
 from ma.orchestrator import Orchestrator
+from ma.locks import FileLockManager, FileLockError
 
 
 class FakeResponse:
@@ -164,6 +165,35 @@ APPROVED PLAN
         diff = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@\n+x\ndiff --git a/secret.env b/secret.env\n--- a/secret.env\n+++ b/secret.env\n@@\n+y\n"
         with self.assertRaises(TaskSpecError):
             enforce_allowed_files(diff, ["calc.py"])
+
+    def test_ready_waves_respects_deps_and_file_locks(self):
+        tasks = [
+            {"id": "A", "allowed_files": ["a.py"], "depends_on": []},
+            {"id": "B", "allowed_files": ["b.py"], "depends_on": []},
+            {"id": "C", "allowed_files": ["c.py"], "depends_on": ["A", "B"]},
+            {"id": "D", "allowed_files": ["a.py"], "depends_on": []},  # conflicts with A
+        ]
+        waves = ready_waves(tasks)
+        # first wave can run A and B (no file overlap); D conflicts with A so later
+        first_ids = {t["id"] for t in waves[0]}
+        self.assertIn("A", first_ids)
+        self.assertIn("B", first_ids)
+        self.assertNotIn("C", first_ids)
+        # C only after A and B done
+        flat = [t["id"] for w in waves for t in w]
+        self.assertLess(flat.index("A"), flat.index("C"))
+        self.assertLess(flat.index("B"), flat.index("C"))
+
+
+class LockTests(unittest.TestCase):
+    def test_file_lock_conflict(self):
+        lm = FileLockManager()
+        lm.acquire("T1", ["a.py", "b.py"])
+        with self.assertRaises(FileLockError):
+            lm.acquire("T2", ["b.py"])
+        lm.release("T1")
+        lm.acquire("T2", ["b.py"])
+        lm.release("T2")
 
 
 class FallbackTests(unittest.TestCase):

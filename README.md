@@ -1,6 +1,6 @@
 # Quang Multi-Agent Orchestrator
 
-Durable local controller that calls separate models through 9Router, persists stage artifacts in SQLite, rejects empty HTTP-200 model responses, isolates work in git worktrees, and records machine verification evidence.
+Durable local controller over 9Router: multi-model roles, SQLite state, per-task git worktrees, DAG waves, file locks, parallel workers, machine verification, Sol audit, optional merge, Telegram fail notify.
 
 ## Model policy
 
@@ -9,9 +9,9 @@ Durable local controller that calls separate models through 9Router, persists st
 | Design / Judgment / Audit | `Ntt_Codex10tr/gpt-5.6-sol` | `nttcodex/gpt-5.6-sol` |
 | Critique | `nttcodex/grok-4.5-high` | Sol |
 | Implementation | `nttcodex/deepseek-v4-pro` | `nttcodex/glm-5.2` |
-| Report | Gemini Flash | Gemini 2.5 Flash → Sol |
+| Report | Gemini Flash | Gemini 2.5 → Sol |
 
-Each model request times out after **15s**, retries up to **3 attempts**, then tries the next fallback model. HTTP 200 with empty content is a hard failure.
+Timeout **15s × 3** per model, then next fallback. Empty HTTP 200 = fail.
 
 ## Install
 
@@ -24,57 +24,51 @@ python -m pip install -e .
 
 ```bash
 ma ship C:/path/to/repo "Implement feature X" --verify "python -m unittest -v"
-```
-
-Optional auto-merge after Sol `APPROVE`:
-
-```bash
-ma ship C:/path/to/repo "Implement feature X" --verify "python -m unittest -v" --merge
-```
-
-Resume existing project:
-
-```bash
-ma ship C:/path/to/repo "goal" --project-id ABC123 --verify "pytest -q"
+ma ship ... --merge              # merge after Sol APPROVE
+ma ship ... --project-id ABC     # resume
 ```
 
 ## Manual gates
 
 ```bash
-ma init <repo> "<goal>" --name <name>
-ma run PROJECT_ID --until judgment
-ma implement PROJECT_ID
-ma verify PROJECT_ID "python -m unittest -v"
-ma audit PROJECT_ID
-ma merge PROJECT_ID   # only after APPROVE
-ma show PROJECT_ID
+ma init / ma run / ma implement / ma verify / ma audit / ma merge / ma show
 ```
 
-## What each stage does
+## Pipeline
 
-1. **design** — Sol architects
-2. **critique** — Grok red-teams
-3. **judgment** — Sol final plan + optional task DAG JSON (`id`, `goal`, `allowed_files`, `verify_command`, `depends_on`)
-4. **implementation** — DeepSeek/GLM returns unified diff into isolated worktree; out-of-scope files rejected
-5. **verification** — machine runs test command; exit code must be 0
-6. **audit** — Sol must return `APPROVE` first
-7. **report** — evidence-grounded summary
-8. **merge** — optional ff-only merge into current branch; never push remote
+1. design → Sol  
+2. critique → Grok  
+3. judgment → Sol + task DAG JSON  
+4. implementation → **per-task worktrees**, DAG waves, file locks, parallel independent tasks  
+5. verification → machine tests on integration worktree  
+6. audit → Sol must start with `APPROVE`  
+7. report  
+8. merge (optional, no remote push)
 
-## Failure notification
+### Task DAG JSON (from judgment)
 
-On ship/model/gate failure, `ma` sends Telegram via Hermes env (`TELEGRAM_BOT_TOKEN` + home channel) and exits code `2`.
+```json
+[{
+  "id": "T1",
+  "goal": "...",
+  "allowed_files": ["src/a.py"],
+  "verify_command": "pytest -q",
+  "depends_on": []
+}]
+```
+
+- Tasks with no deps and no shared `allowed_files` run in the **same wave in parallel** (default `max_workers=2`).
+- Overlapping files are serialized.
+- Each task gets `ma/<project>/<task>` worktree + branch.
+- Integration worktree merges task branches for final verify/audit/merge.
+
+## Failure notify
+
+Telegram via Hermes env. Exit code `2` on failure.
 
 ## State
 
-SQLite default: `C:/Users/OS/.ma/state.sqlite`
-
-Stage machine:
-
-```text
-INTAKE → DESIGN → CRITIQUE → JUDGMENT
-→ IMPLEMENTATION → VERIFICATION → AUDIT → REPORT/DONE
-```
+`C:/Users/OS/.ma/state.sqlite`
 
 ## Tests
 
@@ -82,13 +76,8 @@ INTAKE → DESIGN → CRITIQUE → JUDGMENT
 python -m unittest discover -s tests -v
 ```
 
-## Honest boundary
+## Boundary
 
-Ships one vertical slice well: durable routing, fallback, worktree, allowed-files gate, machine verify, strong-model audit, optional merge, Telegram fail notify.
+Has: routing, fallback, DAG, file lock, parallel waves, per-task worktrees, verify, audit, optional merge, Telegram.
 
-Still not a full software factory:
-- no multi-worker parallel execution
-- no file locks across concurrent projects
-- task DAG is sequential single-implement for now (not one worktree per task)
-- no remote push
-- planning quality depends on live strong models under 15s×3
+Not yet: remote push, multi-project global file lock across processes, dynamic replan mid-ship, budget/token caps.

@@ -4,14 +4,16 @@ import json
 import os
 import sqlite3
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 from .gates import require_approve, require_command_success, require_model_content
+from .locks import FileLockManager
 from .notify import notify_failure
 from .router import NineRouterClient, RouterError
 from .store import TaskStore
-from .tasks import TaskSpec, enforce_allowed_files, parse_task_dag
+from .tasks import enforce_allowed_files, parse_task_dag, ready_waves
 from .workspace import Workspace, extract_diff
 
 DEFAULT_MODELS = {
@@ -23,7 +25,6 @@ DEFAULT_MODELS = {
     "report": "gemini/gemini-3-flash-preview",
 }
 
-# Role fallbacks: primary then backup models
 DEFAULT_FALLBACKS = {
     "design": ["Ntt_Codex10tr/gpt-5.6-sol", "nttcodex/gpt-5.6-sol"],
     "critique": ["nttcodex/grok-4.5-high", "Ntt_Codex10tr/gpt-5.6-sol"],
@@ -39,9 +40,9 @@ SYSTEMS = {
     "judgment": (
         "You are the final technical judge. Reconcile the design and critique into one approved implementation plan. "
         "End with a JSON array of tasks. Each task object MUST have: id, goal, allowed_files (array of paths), "
-        "verify_command, depends_on (array of task ids). Keep tasks minimal and sequential when needed."
+        "verify_command, depends_on (array of task ids). Prefer independent tasks when files do not overlap."
     ),
-    "implementation": "You are an implementation engineer. Return an executable unified diff only, based strictly on the approved plan and repository context. Never claim tests ran.",
+    "implementation": "You are an implementation engineer. Return an executable unified diff only, based strictly on the task goal and repository context. Never claim tests ran.",
     "audit": "You are the final senior auditor. Review requirements, approved plan, diff, and machine evidence. Return APPROVE or REJECT first, then concrete findings.",
     "report": "Compile a concise evidence-grounded report. Do not invent actions, tests, files, or results.",
 }
@@ -73,15 +74,17 @@ class Orchestrator:
         client: NineRouterClient,
         models: dict | None = None,
         fallbacks: dict | None = None,
+        max_workers: int = 2,
     ):
         self.store = store
         self.client = client
         self.models = DEFAULT_MODELS | (models or {})
         self.fallbacks = DEFAULT_FALLBACKS | (fallbacks or {})
+        self.max_workers = max_workers
+        self.file_locks = FileLockManager()
 
     def _call_role(self, role: str, prompt: str, system: str):
         chain = self.fallbacks.get(role) or [self.models[role]]
-        # de-dupe while preserving order
         seen, models = set(), []
         for m in chain:
             if m not in seen:
@@ -143,16 +146,30 @@ class Orchestrator:
                 )
                 self.store.add_evidence(project_id, "task_dag", {"count": len(tasks), "ids": [t.id for t in tasks]})
             except Exception as exc:
-                # judgment can still stand; ship may fall back to single implicit task
                 self.store.add_evidence(project_id, "task_dag_parse_error", {"error": str(exc)})
 
     def verify(self, project_id: str, command: str):
         project = self.store.get_project(project_id)
-        workspace = Workspace(project["repo"], project_id)
-        cwd = workspace.path if workspace.path.exists() else Path(project["repo"])
+        # Prefer integration worktree if present, else first task worktree, else repo
+        integration = Workspace(project["repo"], project_id, task_id="integration")
+        cwd = project["repo"]
+        if integration.path.exists():
+            cwd = integration.path
+        else:
+            tasks = self.store.list_tasks(project_id)
+            for t in tasks:
+                ws = Workspace(project["repo"], project_id, task_id=t["id"])
+                if ws.path.exists():
+                    cwd = ws.path
+                    break
+            else:
+                legacy = Workspace(project["repo"], project_id)
+                if legacy.path.exists():
+                    cwd = legacy.path
         proc = subprocess.run(command, cwd=cwd, shell=True, text=True, capture_output=True)
         evidence = {
             "command": command,
+            "cwd": str(cwd),
             "exit_code": proc.returncode,
             "stdout": proc.stdout[-20000:],
             "stderr": proc.stderr[-20000:],
@@ -168,87 +185,167 @@ class Orchestrator:
         )
         return evidence
 
+    def _implement_one_task(self, project: dict, project_id: str, task: dict, base: str = "HEAD") -> dict:
+        task_id = task["id"]
+        allowed = task["allowed_files"]
+        self.file_locks.acquire(task_id, allowed)
+        try:
+            self.store.set_task_status(task_id, "IMPLEMENTING")
+            workspace = Workspace(project["repo"], project_id, task_id=task_id)
+            workspace.create(base=base)
+            snapshot = workspace.snapshot()
+            allowed_clause = f"ALLOWED FILES ONLY: {allowed}\n"
+            prompt = (
+                f"PROJECT GOAL:\n{project['goal']}\n\nTASK ID: {task_id}\nTASK GOAL:\n{task['goal']}\n\n"
+                f"APPROVED PLAN:\n{self.store.get_artifact(project_id, 'judgment')}\n\n"
+                f"REPOSITORY SNAPSHOT:\n{snapshot}\n\n{allowed_clause}"
+                "Return only a unified git diff. Keep changes minimal."
+            )
+            chain = self.fallbacks.get("implementation") or [self.models["implementation"]]
+            seen, models = set(), []
+            for m in chain:
+                if m not in seen:
+                    seen.add(m)
+                    models.append(m)
+            last_errors: list[str] = []
+            chosen = None
+            for model in models:
+                for attempt_prompt, tag in (
+                    (prompt, "full"),
+                    (
+                        (
+                            f"Return ONLY a unified git diff. Output must start with 'diff --git'.\n"
+                            f"Task: {task['goal']}\n{allowed_clause}"
+                            f"Repo snapshot:\n{snapshot}\n"
+                        ),
+                        "tight",
+                    ),
+                ):
+                    try:
+                        result = self.client.call(model, attempt_prompt, system=SYSTEMS["implementation"])
+                        patch = extract_diff(require_model_content(result.content))
+                        workspace.apply_patch(patch)
+                        diff = workspace.diff()
+                        if not diff.strip():
+                            raise RuntimeError("worker patch produced no repository diff")
+                        if allowed and allowed != ["."]:
+                            enforce_allowed_files(diff, allowed)
+                        chosen = (model, result, diff, tag, last_errors)
+                        break
+                    except Exception as exc:
+                        last_errors.append(f"{model}/{tag}: {exc}")
+                        workspace.reset_hard()
+                if chosen:
+                    break
+            if not chosen:
+                self.store.set_task_status(task_id, "FAILED")
+                raise RouterError(f"task {task_id}: all models failed: " + " | ".join(last_errors))
+            model, result, diff, tag, fallback_errors = chosen
+            workspace.commit(f"ma: {task_id}")
+            # per-task verify if present
+            verify_cmd = task.get("verify_command")
+            verify_evidence = None
+            if verify_cmd:
+                proc = subprocess.run(verify_cmd, cwd=workspace.path, shell=True, text=True, capture_output=True)
+                verify_evidence = {
+                    "command": verify_cmd,
+                    "exit_code": proc.returncode,
+                    "stdout": proc.stdout[-10000:],
+                    "stderr": proc.stderr[-10000:],
+                }
+                if proc.returncode != 0:
+                    self.store.set_task_status(task_id, "VERIFY_FAILED")
+                    raise RuntimeError(f"task {task_id} verify failed: {verify_evidence}")
+            self.store.set_task_status(task_id, "IMPLEMENTED")
+            evidence = {
+                "task_id": task_id,
+                "model": model,
+                "latency_ms": result.latency_ms,
+                "worktree": str(workspace.path),
+                "branch": workspace.branch,
+                "diff_chars": len(diff),
+                "allowed_files": allowed,
+                "prompt_mode": tag,
+                "fallback_errors": fallback_errors,
+                "verify": verify_evidence,
+            }
+            self.store.add_evidence(project_id, "task_implementation", evidence)
+            return evidence
+        finally:
+            self.file_locks.release(task_id, allowed)
+
     def implement(self, project_id: str, *, allowed_files: list[str] | None = None) -> dict:
         if self.store.next_stage(project_id) != "implementation":
             raise ValueError(f"implementation not ready; next stage is {self.store.next_stage(project_id)}")
         project = self.store.get_project(project_id)
-        workspace = Workspace(project["repo"], project_id)
-        workspace.create()
-        snapshot = workspace.snapshot()
         tasks = self.store.list_tasks(project_id)
-        task_block = ""
-        if tasks:
-            task_block = "TASKS:\n" + json.dumps(tasks, ensure_ascii=False, indent=2) + "\n\n"
-        allowed = allowed_files
-        if not allowed and tasks:
-            # union of all task allowed files for single-shot implement
-            allowed = sorted({f for t in tasks for f in t["allowed_files"]})
-        allowed_clause = f"ALLOWED FILES ONLY: {allowed}\n" if allowed else ""
-        prompt = (
-            f"PROJECT GOAL:\n{project['goal']}\n\nAPPROVED PLAN:\n"
-            f"{self.store.get_artifact(project_id, 'judgment')}\n\n{task_block}"
-            f"REPOSITORY SNAPSHOT:\n{snapshot}\n\n{allowed_clause}"
-            "Return only a unified git diff. Keep changes minimal. Do not edit generated, secret, or unrelated files."
+        if not tasks:
+            # fallback single synthetic task over whole repo goal
+            tasks = [
+                {
+                    "id": "T1",
+                    "goal": project["goal"],
+                    "allowed_files": allowed_files or ["."],
+                    "verify_command": "python -m unittest discover -s . -v",
+                    "depends_on": [],
+                    "status": "READY",
+                }
+            ]
+            # if allowed is ["."] skip enforce later by expanding? better require real files
+            if tasks[0]["allowed_files"] == ["."]:
+                # keep enforce soft: allowed_files None path in enforce by listing tracked? force user/tasks
+                pass
+            self.store.replace_tasks(project_id, tasks)
+
+        waves = ready_waves(tasks)
+        all_results: list[dict] = []
+        for wave_idx, wave in enumerate(waves):
+            self.store.add_evidence(project_id, "wave_start", {"wave": wave_idx, "tasks": [t["id"] for t in wave]})
+            if len(wave) == 1 or self.max_workers <= 1:
+                for t in wave:
+                    all_results.append(self._implement_one_task(project, project_id, t))
+            else:
+                with ThreadPoolExecutor(max_workers=min(self.max_workers, len(wave))) as pool:
+                    futures = {pool.submit(self._implement_one_task, project, project_id, t): t["id"] for t in wave}
+                    for fut in as_completed(futures):
+                        tid = futures[fut]
+                        try:
+                            all_results.append(fut.result())
+                        except Exception as exc:
+                            raise RuntimeError(f"parallel task {tid} failed: {exc}") from exc
+            self.store.add_evidence(project_id, "wave_done", {"wave": wave_idx, "results": [r["task_id"] for r in all_results if r.get("task_id") in {t['id'] for t in wave}]})
+
+        # Integration worktree: merge all task branches in dependency order
+        integration = Workspace(project["repo"], project_id, task_id="integration")
+        if integration.path.exists():
+            integration.remove()
+        integration.create(base="HEAD")
+        merged_branches = []
+        for wave in waves:
+            for t in wave:
+                branch = f"ma/{project_id}/{t['id']}"
+                integration.merge_branch(branch)
+                merged_branches.append(branch)
+        integration.commit(f"ma: integrate {project_id}")
+        combined_diff = integration.diff()
+        # also include committed history as empty working tree; use merge-base style summary
+        if not combined_diff.strip():
+            # after commit, working tree clean — store branch list as artifact
+            combined_diff = "\n".join(f"merged {b}" for b in merged_branches) + "\n"
+
+        artifact = json.dumps(
+            {
+                "integration_worktree": str(integration.path),
+                "integration_branch": integration.branch,
+                "task_results": all_results,
+                "merged_branches": merged_branches,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
-        # Try full prompt first, then a tight diff-only retry on each fallback model.
-        chain = self.fallbacks.get("implementation") or [self.models["implementation"]]
-        seen, models = set(), []
-        for m in chain:
-            if m not in seen:
-                seen.add(m)
-                models.append(m)
-        last_errors: list[str] = []
-        chosen = None
-        for model in models:
-            for attempt_prompt, tag in (
-                (prompt, "full"),
-                (
-                    (
-                        f"Return ONLY a unified git diff. Output must start with 'diff --git'.\n"
-                        f"Goal: {project['goal']}\n"
-                        f"{allowed_clause}"
-                        f"Repo snapshot:\n{snapshot}\n"
-                        f"Approved plan:\n{self.store.get_artifact(project_id, 'judgment')[:4000]}\n"
-                    ),
-                    "tight",
-                ),
-            ):
-                try:
-                    result = self.client.call(model, attempt_prompt, system=SYSTEMS["implementation"])
-                    patch = extract_diff(require_model_content(result.content))
-                    workspace.apply_patch(patch)
-                    diff = workspace.diff()
-                    if not diff.strip():
-                        raise RuntimeError("worker patch produced no repository diff")
-                    if allowed:
-                        enforce_allowed_files(diff, allowed)
-                    chosen = (model, result, diff, attempt_prompt, tag, last_errors)
-                    break
-                except Exception as exc:
-                    last_errors.append(f"{model}/{tag}: {exc}")
-                    # reset dirty worktree between failed apply attempts
-                    if workspace.path.exists():
-                        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=workspace.path, capture_output=True)
-                        subprocess.run(["git", "clean", "-fd"], cwd=workspace.path, capture_output=True)
-            if chosen:
-                break
-        if not chosen:
-            raise RouterError("implementation: all models failed: " + " | ".join(last_errors))
-        model, result, diff, used_prompt, tag, fallback_errors = chosen
-        self.store.record_stage(project_id, "implementation", model, used_prompt, diff)
-        evidence = {
-            "model": model,
-            "latency_ms": result.latency_ms,
-            "worktree": str(workspace.path),
-            "diff_chars": len(diff),
-            "allowed_files": allowed,
-            "prompt_mode": tag,
-            "fallback_errors": fallback_errors,
-        }
-        self.store.add_evidence(project_id, "implementation", evidence)
-        for t in tasks:
-            self.store.set_task_status(t["id"], "IMPLEMENTED")
-        return evidence
+        self.store.record_stage(project_id, "implementation", "multi-task", "per-task workers", artifact)
+        self.store.add_evidence(project_id, "implementation", {"tasks": len(all_results), "waves": len(waves), "integration": str(integration.path)})
+        return {"tasks": all_results, "waves": len(waves), "integration": str(integration.path)}
 
     def audit(self, project_id: str):
         if self.store.next_stage(project_id) != "audit":
@@ -259,13 +356,16 @@ class Orchestrator:
 
     def merge(self, project_id: str) -> dict:
         project = self.store.get_project(project_id)
-        # require audit APPROVE already recorded
         audit = self.store.get_artifact(project_id, "audit")
         require_approve(audit)
-        workspace = Workspace(project["repo"], project_id)
-        if not workspace.path.exists():
-            raise RuntimeError("worktree missing; cannot merge")
-        result = workspace.merge_into_repo(f"ma: {project_id} approved")
+        integration = Workspace(project["repo"], project_id, task_id="integration")
+        if integration.path.exists():
+            result = integration.merge_into_repo(f"ma: {project_id} approved")
+        else:
+            workspace = Workspace(project["repo"], project_id)
+            if not workspace.path.exists():
+                raise RuntimeError("worktree missing; cannot merge")
+            result = workspace.merge_into_repo(f"ma: {project_id} approved")
         self.store.add_evidence(project_id, "merge", result)
         return result
 
@@ -276,7 +376,6 @@ class Orchestrator:
         verify_command: str | None = None,
         merge: bool = False,
     ) -> dict:
-        """One-command pipeline. Never merges unless merge=True AND audit APPROVE."""
         try:
             while True:
                 stage = self.store.next_stage(project_id)
@@ -299,10 +398,7 @@ class Orchestrator:
                     self.audit(project_id)
                     continue
                 break
-            if merge:
-                merge_info = self.merge(project_id)
-            else:
-                merge_info = {"merged": False, "reason": "merge not requested"}
+            merge_info = self.merge(project_id) if merge else {"merged": False, "reason": "merge not requested"}
             project = self.store.get_project(project_id)
             return {
                 "project_id": project_id,
