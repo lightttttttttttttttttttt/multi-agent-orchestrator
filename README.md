@@ -1,60 +1,60 @@
 # multi-agent-orchestrator (`ma`)
 
-Local multi-model software factory over [9Router](http://127.0.0.1:20128).
+Factory phần mềm multi-model chạy local, điều phối qua [9Router](http://127.0.0.1:20128).
 
-`ma` does **not** role-play one chat into many agents.  
-It runs a durable pipeline where each stage calls a separate model, persists state in SQLite, isolates code changes in git worktrees, verifies with real commands, and only merges after hard gates pass.
+`ma` **không** bắt một chat đóng nhiều vai.  
+Mỗi stage gọi model riêng, lưu state bằng SQLite, sửa code trong git worktree tách biệt, verify bằng lệnh thật, chỉ merge khi qua đủ gate cứng.
 
 ---
 
-## What it does
+## Làm được gì
 
 ```text
 preflight
   → design (Sol)
   → critique (Grok)
-  → judgment (Sol)          # task DAG JSON
-  → implement (DeepSeek/GLM) # per-task worktrees, parallel waves
-  → verify                  # machine tests
-  → audit (Sol)             # must start with APPROVE
+  → judgment (Sol)          # sinh task DAG JSON
+  → implement (DeepSeek/GLM) # worktree theo task, chạy song song theo wave
+  → verify                  # test máy thật
+  → audit (Sol)             # phải bắt đầu bằng APPROVE
   → report (Gemini)
-  → optional merge/push     # optional human approval
+  → merge/push tùy chọn     # có thể bắt human approve
 ```
 
-### Highlights
+### Điểm chính
 
-- **Separate model requests per role** via local 9Router
-- **15s × 3 timeout brake**, then role fallback / hard fail
-- **Dead-model blacklist** inside a run (failed model not retried forever)
-- **Task DAG** with `allowed_files`, `depends_on`, `verify_command`
-- **Per-task git worktrees** + file locks (cross-process)
-- **Parallel workers** (`--workers 0` auto-scales up to 4)
-- **Secret scan** on patches before apply/merge
-- **Budget caps** (`--max-calls`, `--max-tokens`)
-- **Usage/cost ledger** (provider tokens preferred, estimate fallback)
-- **Telegram notify** on failure
-- **Event stream** + `watch` / hard `cancel` (PID kill)
-- **Human approval gate** before merge/push
-- **Job queue** for multi-worker machines (`enqueue` / `worker`)
-- **Self-hosted GitHub Action** template
+- **Gọi model tách request theo role** qua 9Router local
+- **Timeout 15s × 3**, rồi fallback / fail cứng
+- **Blacklist model chết** trong cùng 1 run
+- **Task DAG** có `allowed_files`, `depends_on`, `verify_command`
+- **Git worktree theo task** + file lock (kể cả cross-process)
+- **Worker song song** (`--workers 0` auto tối đa 4)
+- **Secret scan** trước khi apply/merge
+- **Budget** (`--max-calls`, `--max-tokens`)
+- **Usage/cost ledger** (ưu tiên token provider, fallback ước lượng)
+- **Telegram notify** khi fail
+- **Event stream** + `watch` / `cancel` hard (kill PID)
+- **Human approval** trước merge/push
+- **Job queue** multi-worker (`enqueue` / `worker`)
+- **GitHub Action** self-hosted sẵn template
 
 ---
 
-## Requirements
+## Yêu cầu
 
 - Python **3.11+**
 - Git
-- Local **9Router** on `http://127.0.0.1:20128`
-- Windows / Linux / macOS (hard cancel uses `taskkill` on Windows)
+- **9Router** local tại `http://127.0.0.1:20128`
+- Windows / Linux / macOS (hard cancel trên Windows dùng `taskkill`)
 
-Optional:
-- Telegram bot env vars for failure alerts
-- `MA_QUEUE_TOKEN` for multi-worker queue auth
-- Self-hosted GitHub runner labeled `ma`
+Tuỳ chọn:
+- Biến môi trường Telegram để báo fail
+- `MA_QUEUE_TOKEN` cho queue multi-worker
+- Self-hosted GitHub runner gắn label `ma`
 
 ---
 
-## Install
+## Cài đặt
 
 ```bash
 git clone https://github.com/lightttttttttttttttttttt/multi-agent-orchestrator.git
@@ -63,64 +63,64 @@ python -m pip install -e .
 ma doctor --no-probe
 ```
 
-Package name: `quang-multi-agent`  
-CLI entrypoint: `ma`
+- Package: `quang-multi-agent`
+- CLI: `ma`
 
 ---
 
-## Quick start
+## Dùng nhanh
 
 ```bash
-# health
+# kiểm tra hệ thống
 ma doctor
 
-# one-command ship
-ma ship C:/path/to/repo "Add subtract(a, b) to calc.py" \
+# ship 1 phát
+ma ship C:/path/to/repo "Thêm subtract(a, b) vào calc.py" \
   --verify "python -m unittest -v" \
   --workers 0
 
-# watch progress in another terminal
+# terminal khác: xem progress
 ma watch PROJECT_ID --follow
 
-# cancel hard (kills ship process tree on Windows)
+# huỷ cứng (kill process tree trên Windows)
 ma cancel PROJECT_ID
 
-# soft cancel only (cooperative between stages)
+# huỷ mềm (chỉ chặn giữa các stage)
 ma cancel PROJECT_ID --soft
 ```
 
-### Merge safely
+### Merge an toàn
 
 ```bash
-# audit APPROVE is required; human approval also required with this flag
+# cần Sol APPROVE; thêm human approval nếu bật flag này
 ma ship C:/path/to/repo "goal" --verify "pytest -q" --merge --require-approval
 
-# grant human approval, then merge
+# cấp quyền human, rồi merge
 ma approve PROJECT_ID
 ma merge PROJECT_ID --require-approval
 
-# push also requires approval
+# push cũng bắt approval
 ma merge PROJECT_ID --push --require-approval
 ```
 
 ---
 
-## CLI map
+## Bản đồ lệnh
 
-| Command | Purpose |
+| Lệnh | Việc |
 |---|---|
 | `ma doctor` | Preflight 9Router / key / git / `~/.ma` |
-| `ma ship` | Full pipeline |
-| `ma init` / `run` / `status` / `show` | Project lifecycle |
-| `ma implement` / `verify` / `audit` | Manual stage control |
-| `ma merge` | Fast-forward merge after APPROVE |
-| `ma watch` | Tail JSONL events |
-| `ma cancel` | Soft/hard cancel |
-| `ma approve` | Human merge/push gate |
-| `ma report` | Export markdown/json report |
-| `ma usage` | Cost/token ledger |
-| `ma clean` | Remove project worktrees |
-| `ma enqueue` / `worker` / `queue` / `job` | Multi-worker job queue |
+| `ma ship` | Chạy full pipeline |
+| `ma init` / `run` / `status` / `show` | Vòng đời project |
+| `ma implement` / `verify` / `audit` | Chạy stage thủ công |
+| `ma merge` | Fast-forward sau APPROVE |
+| `ma watch` | Xem event JSONL |
+| `ma cancel` | Huỷ soft/hard |
+| `ma approve` | Human gate cho merge/push |
+| `ma report` | Xuất report markdown/json |
+| `ma usage` | Xem token/cost |
+| `ma clean` | Dọn worktree |
+| `ma enqueue` / `worker` / `queue` / `job` | Queue multi-worker |
 
 ```bash
 ma --help
@@ -128,7 +128,7 @@ ma --help
 
 ---
 
-## Default model routing
+## Route model mặc định
 
 | Stage | Primary | Fallback |
 |---|---|---|
@@ -137,46 +137,46 @@ ma --help
 | implementation | `nttcodex/deepseek-v4-pro` | `nttcodex/glm-5.2` |
 | report | `gemini/gemini-3-flash-preview` | Gemini 2.5 → Sol |
 
-Each model call: **timeout 15s, up to 3 attempts**, then next fallback.  
-HTTP 200 with empty content is treated as failure.
+Mỗi call: **timeout 15s, tối đa 3 lần**, rồi nhảy fallback.  
+HTTP 200 mà content rỗng = fail.
 
-Routing is configured in `ma/defaults.py`.
+Cấu hình nằm ở `ma/defaults.py`.
 
 ---
 
-## Safety gates (not optional)
+## Gate an toàn (không bỏ qua)
 
 1. **Preflight** — 9Router up, API key, git
-2. **Empty model content** rejected
-3. **Unified diff only** for implement workers
-4. **Secret scan** on patch/diff
-5. **`allowed_files` scope** enforcement
-6. **Machine verify** exit code must be `0`
-7. **Sol audit** must begin with `APPROVE`
-8. **Budget** can hard-stop a run
-9. **Human approval** when `--require-approval` / `--push`
-10. **No auto-merge by default** — merge is explicit
+2. **Content rỗng** bị chặn
+3. Worker implement chỉ được trả **unified diff**
+4. **Secret scan** trên patch/diff
+5. Chỉ đụng file trong **`allowed_files`**
+6. **Verify máy** phải exit code `0`
+7. **Sol audit** phải bắt đầu bằng `APPROVE`
+8. **Budget** có thể dừng run
+9. **Human approval** khi `--require-approval` / `--push`
+10. **Không auto-merge mặc định** — merge phải bật tay
 
-`ma` will not invent green tests or claim success without tool output.
+`ma` không được bịa test xanh hay claim success khi chưa có output tool.
 
 ---
 
-## Task DAG format
+## Format task DAG
 
-Judgment stage should end with a JSON array like:
+Stage judgment nên kết thúc bằng JSON array:
 
 ```json
 [
   {
     "id": "T_CALC",
-    "goal": "Add subtract(a, b) returning a - b",
+    "goal": "Thêm subtract(a, b) trả về a - b",
     "allowed_files": ["calc.py"],
     "verify_command": "python -m unittest -v",
     "depends_on": []
   },
   {
     "id": "T_TEXT",
-    "goal": "Add whisper(s) helper",
+    "goal": "Thêm helper whisper(s)",
     "allowed_files": ["textutil.py"],
     "verify_command": "python -m unittest -v",
     "depends_on": []
@@ -184,37 +184,37 @@ Judgment stage should end with a JSON array like:
 ]
 ```
 
-Rules:
-- Independent tasks with non-overlapping files can run in parallel waves
-- Overlapping `allowed_files` or dependencies force later waves
-- Patch touching files outside `allowed_files` fails
+Quy tắc:
+- Task độc lập, không trùng file → chạy song song theo wave
+- Trùng `allowed_files` hoặc có dependency → wave sau
+- Patch đụng file ngoài scope → fail
 
 ---
 
-## State & artifacts
+## State & artifact
 
-| Path | Content |
+| Path | Nội dung |
 |---|---|
-| `~/.ma/state.sqlite` | Projects, stages, tasks, evidence |
-| `~/.ma/events/<id>.jsonl` | Progress events |
-| `~/.ma/events/<id>.pid` | Ship process PID |
-| `~/.ma/events/<id>.cancel` | Cancel marker |
-| `~/.ma/approvals/` | Human approval files |
-| `~/.ma/queue.sqlite` | Worker job queue |
-| `~/.ma/usage.sqlite` | Token/cost ledger |
-| `~/.ma/rates.json` | Optional USD/1M rates override |
-| `~/.ma/file_locks.sqlite` | Cross-process file locks |
-| `<repo>/.ma/reports/<id>.md` | Ship report |
-| sibling worktrees | `*-ma-<project>*` |
+| `~/.ma/state.sqlite` | Project, stage, task, evidence |
+| `~/.ma/events/<id>.jsonl` | Event progress |
+| `~/.ma/events/<id>.pid` | PID process ship |
+| `~/.ma/events/<id>.cancel` | Marker huỷ |
+| `~/.ma/approvals/` | File human approval |
+| `~/.ma/queue.sqlite` | Job queue |
+| `~/.ma/usage.sqlite` | Token/cost |
+| `~/.ma/rates.json` | Override giá USD/1M token |
+| `~/.ma/file_locks.sqlite` | File lock cross-process |
+| `<repo>/.ma/reports/<id>.md` | Report sau ship |
+| worktree sibling | `*-ma-<project>*` |
 
 ---
 
-## Multi-worker queue
+## Queue multi-worker
 
 ```bash
-# optional shared auth
+# auth tuỳ chọn
 export MA_QUEUE_TOKEN=super-secret
-# or write ~/.ma/queue.token
+# hoặc ghi ~/.ma/queue.token
 
 ma enqueue C:/path/to/repo "goal" --verify "pytest -q" --token "$MA_QUEUE_TOKEN"
 ma worker --once --token "$MA_QUEUE_TOKEN"
@@ -222,8 +222,8 @@ ma queue
 ma job JOB_ID
 ```
 
-If `MA_QUEUE_TOKEN` / `~/.ma/queue.token` is set, enqueue/claim/complete require the correct token.  
-If unset, local open mode is allowed.
+Nếu đã set token thì enqueue/claim/complete bắt buộc đúng token.  
+Chưa set = open mode local.
 
 ---
 
@@ -231,21 +231,21 @@ If unset, local open mode is allowed.
 
 Workflow: [`.github/workflows/ma-ship.yml`](.github/workflows/ma-ship.yml)
 
-Designed for a **self-hosted Windows runner** with labels:
+Dùng **self-hosted Windows runner** với labels:
 
 ```text
 [self-hosted, Windows, ma]
 ```
 
-so the runner can reach local 9Router (`localhost:20128`).
+để runner chạm được 9Router local (`localhost:20128`).
 
-Supports:
-- `workflow_dispatch` with goal / verify / merge
-- PR title as goal
+Hỗ trợ:
+- `workflow_dispatch` với goal / verify / merge
+- PR title làm goal
 
 ---
 
-## Useful ship flags
+## Flag ship hay dùng
 
 ```bash
 ma ship REPO "goal" \
@@ -260,31 +260,31 @@ ma ship REPO "goal" \
   --push
 ```
 
-| Flag | Meaning |
+| Flag | Ý nghĩa |
 |---|---|
-| `--workers 0` | Auto workers by wave size (≤ 4) |
-| `--max-calls` | Hard call budget |
-| `--max-tokens` | Hard token budget |
-| `--max-replans` | Sol replan attempts after task fail |
-| `--project-id` | Resume existing project |
-| `--merge` | Merge after APPROVE |
-| `--require-approval` | Need `ma approve` first |
-| `--push` | Push after merge (implies approval gate) |
+| `--workers 0` | Auto worker theo wave (≤ 4) |
+| `--max-calls` | Giới hạn số call |
+| `--max-tokens` | Giới hạn token |
+| `--max-replans` | Số lần Sol replan khi task fail |
+| `--project-id` | Resume project cũ |
+| `--merge` | Merge sau APPROVE |
+| `--require-approval` | Cần `ma approve` trước |
+| `--push` | Push sau merge (kéo theo approval) |
 
 ---
 
-## Cost accounting
+## Cost / usage
 
 ```bash
 ma usage
 ma usage PROJECT_ID
 ```
 
-- Prefers provider `usage.prompt_tokens` / `completion_tokens`
-- Falls back to `chars/4` estimate
-- Override rates in `~/.ma/rates.json`
+- Ưu tiên `usage.prompt_tokens` / `completion_tokens` từ provider
+- Không có thì ước lượng `chars/4`
+- Sửa giá ở `~/.ma/rates.json`
 
-Example rates file:
+Ví dụ:
 
 ```json
 {
@@ -297,46 +297,46 @@ Example rates file:
 }
 ```
 
-Costs are **estimates** unless the provider returns real usage.
+Cost là **ước lượng** nếu provider không trả usage thật.
 
 ---
 
-## Tests
+## Test
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Current suite covers routing retries, gates, DAG waves, locks, secrets, usage, queue auth, approval, events/cancel, worktrees, and ops helpers.
+Suite cover: retry router, gate, DAG wave, lock, secret, usage, queue auth, approval, event/cancel, worktree, ops.
 
 ---
 
-## Design stance
+## Quan điểm thiết kế
 
-- Strong models decide / audit
-- Cheap models write bounded diffs
-- Machines verify
-- Humans approve merge/push when asked
-- Empty success is forbidden
-- Fail loud, notify, stop
+- Model mạnh quyết định / audit
+- Model rẻ viết diff có scope
+- Máy verify
+- Người approve merge/push khi cần
+- Cấm success rỗng
+- Fail thì báo, dừng, không liều
 
-This is a **local software factory**, not a chat toy.
-
----
-
-## License / status
-
-Personal tooling for multi-model delivery over a local 9Router gateway.  
-Expect sharp edges around long planning prompts, provider rate limits, and self-hosted runner setup.
+Đây là **software factory local**, không phải chat toy.
 
 ---
 
-## Minimal mental model
+## Trạng thái
+
+Tool cá nhân để ship code multi-model qua 9Router local.  
+Còn edge: planning prompt dài, rate-limit provider, setup self-hosted runner.
+
+---
+
+## Mental model gọn
 
 ```text
-Sol plans + judges + audits
-Grok red-teams
-DeepSeek/GLM codes in isolated worktrees
-pytest/unittest decides reality
-ma ships only when gates pass
+Sol lên plan + chấm + audit
+Grok red-team
+DeepSeek/GLM code trong worktree riêng
+pytest/unittest chốt sự thật
+ma chỉ ship khi qua gate
 ```
